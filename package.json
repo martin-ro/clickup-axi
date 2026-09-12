@@ -1,0 +1,23 @@
+{
+  "name": "@martin-ro/clickup-axi",
+  "version": "0.1.0",
+  "description": "An agent-friendly ClickUp CLI with compact TOON output",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "clickup-axi": "bin/clickup-axi.js"
+  },
+  "files": ["bin", "src", "skills"],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node bin/clickup-axi.js",
+    "test": "node --test",
+    "skill": "node scripts/skill.js",
+    "check": "node scripts/skill.js --check && node --test"
+  },
+  "dependencies": {
+    "axi-sdk-js": "0.1.11"
+  }
+}
