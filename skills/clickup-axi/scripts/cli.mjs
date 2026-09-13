@@ -1,12 +1,11 @@
 import { parseArgs } from 'node:util';
-import { fileURLToPath } from 'node:url';
-import { AxiError, renderOutput } from './output.js';
-import { setupHooks } from './hooks.js';
-import { createClient, numericID, taskID, readDefaults, requireArray, requireTask, usage } from './api.js';
-import { BOOLEAN_FLAGS, COMMANDS, DESCRIPTION, GUIDANCE, TOP_LEVEL_HELP, commandHelp } from './help.js';
-import { VERSION } from './version.js';
+import { ENTRY, invocation, shellQuote } from './invocation.mjs';
+import { AxiError, renderOutput } from './output.mjs';
+import { setupHooks } from './hooks.mjs';
+import { createClient, numericID, taskID, readDefaults, requireArray, requireTask, usage } from './api.mjs';
+import { BOOLEAN_FLAGS, COMMANDS, DESCRIPTION, guidance, topLevelHelp, commandHelp } from './help.mjs';
+import { VERSION } from './version.mjs';
 
-const ENTRY = fileURLToPath(new URL('../bin/clickup-axi.js', import.meta.url));
 const FIELDS = ['id', 'name', 'status', 'list', 'custom_id', 'priority', 'assignees', 'due_date', 'url', 'parent', 'tags'];
 const PRIORITIES = { urgent: 1, high: 2, normal: 3, low: 4, none: null };
 
@@ -23,12 +22,12 @@ function selector(value, name) {
   if (isID(value)) numericID(value, name);
 }
 
-export function parseCommand(command, argv) {
+export function parseCommand(command, argv, bin = invocation().command) {
   if (command === 'task' && ['create', 'update', 'comment', 'move', 'close'].includes(argv[0])) {
     command += ` ${argv[0]}`;
     argv = argv.slice(1);
   }
-  if (!Object.hasOwn(COMMANDS, command)) usage('Unknown command.');
+  if (!Object.hasOwn(COMMANDS, command)) usage(command === 'auth' ? 'The auth command was removed. Set CLICKUP_API_TOKEN in the environment or .env.' : `Unknown command ${JSON.stringify(command)}.`, `Commands: ${Object.keys(COMMANDS).join(', ')}. Run \`${bin} <command> --help\`.`);
   const spec = COMMANDS[command];
   const known = [...Object.keys(spec.flags), 'help'];
   const repeatable = new Set(command === 'task create' ? ['tag'] : command === 'task update' ? ['add-tag', 'remove-tag'] : []);
@@ -36,7 +35,7 @@ export function parseCommand(command, argv) {
   try {
     parsed = parseArgs({ args: argv, allowPositionals: true, strict: true, tokens: true, options: Object.fromEntries(known.map(key => [key, { type: BOOLEAN_FLAGS.has(key) ? 'boolean' : 'string', multiple: repeatable.has(key) }])) });
   } catch (error) {
-    usage(error.message, `Valid flags for ${command}: ${known.map(key => `--${key}`).join(', ')}. Run \`clickup-axi ${command} --help\`.`);
+    usage(error.message, `Valid flags for ${command}: ${known.map(key => `--${key}`).join(', ')}. Run \`${bin} ${command} --help\`.`);
   }
   const seen = new Set();
   for (const token of parsed.tokens.filter(token => token.kind === 'option')) {
@@ -47,7 +46,7 @@ export function parseCommand(command, argv) {
   const args = parsed.positionals;
   if (flags.help) return { command, flags, args };
   const arity = ['task', 'task update', 'task comment', 'task move', 'task close', 'comments', 'list', 'search', 'setup'].includes(command) ? 1 : 0;
-  if (args.length !== arity) usage(`Expected ${arity} argument(s) for ${command}.`, `Run \`clickup-axi ${spec.usage}\`.`);
+  if (args.length !== arity) usage(`Expected ${arity} argument(s) for ${command}.`, `Run \`${bin} ${spec.usage}\`.`);
   for (const [key, values] of Object.entries(flags)) {
     for (const value of [values].flat()) {
       if (typeof value === 'string' && !value.trim() && key !== 'description') usage(`--${key} must not be empty.`);
@@ -62,15 +61,15 @@ export function parseCommand(command, argv) {
     taskID(flags.parent);
     if (fold(flags.parent) === 'none') usage('ClickUp cannot clear a parent through this API. Use ClickUp to promote a subtask.');
   }
-  if (['folders', 'tags'].includes(command) && !flags.space) usage('--space is required.', 'Run `clickup-axi spaces` to find a Space.');
-  if (command === 'lists' && !flags.space && !flags.folder) usage('Use --space or --folder.', 'Run `clickup-axi folders --space <id>` to find Folders.');
+  if (['folders', 'tags'].includes(command) && !flags.space) usage('--space is required.', `Run \`${bin} spaces\` to find a Space.`);
+  if (command === 'lists' && !flags.space && !flags.folder) usage('Use --space or --folder.', `Run \`${bin} folders --space <id>\` to find Folders.`);
   for (const [label, value] of [['List', command === 'list' ? args[0] : flags.list], ['Folder', flags.folder]]) {
     if (value !== undefined && !isID(value) && !flags.space) usage(`${label} names require --space.`, 'Supply --space <name|id>, or use a numeric ID.');
   }
   if (command === 'task move' && !flags.list) usage('--list is required for a move; project defaults are not used.');
   if (command === 'setup' && !['hooks', 'status', 'remove'].includes(args[0])) usage('Use setup hooks, setup status, or setup remove.');
-  if (command === 'task create' && !flags.name) usage('--name is required.', 'Run `clickup-axi task create --list <id> --name "<name>"`.');
-  if (command === 'task comment' && !flags.text) usage('--text is required.', 'Run `clickup-axi task comment <id> --text "<text>"`.');
+  if (command === 'task create' && !flags.name) usage('--name is required.', `Run \`${bin} task create --list <id> --name "<name>"\`.`);
+  if (command === 'task comment' && !flags.text) usage('--text is required.', `Run \`${bin} task comment <id> --text "<text>"\`.`);
   if (command === 'search' && !args[0].trim()) usage('Search words must not be empty.');
   if (Boolean(flags.start) !== Boolean(flags['start-id'])) usage('--start and --start-id must be used together.');
   if (flags.start !== undefined) numericID(flags.start, '--start');
@@ -98,7 +97,7 @@ export function parseCommand(command, argv) {
     const date = new Date(`${flags.due}T00:00:00.000Z`);
     if (!/^\d{4}-\d{2}-\d{2}$/.test(flags.due) || !Number.isFinite(date.getTime()) || date.toISOString().slice(0, 10) !== flags.due) usage('--due must be a real YYYY-MM-DD date or none.');
   }
-  if (command === 'task update' && !['name', 'description', 'append-description', 'status', 'priority', 'due', 'assignee', 'unassign', 'parent', 'add-tag', 'remove-tag'].some(key => flags[key] !== undefined)) usage('Supply at least one task field to update.', 'Run `clickup-axi task update --help`.');
+  if (command === 'task update' && !['name', 'description', 'append-description', 'status', 'priority', 'due', 'assignee', 'unassign', 'parent', 'add-tag', 'remove-tag'].some(key => flags[key] !== undefined)) usage('Supply at least one task field to update.', `Run \`${bin} task update --help\`.`);
   return { command, flags, args };
 }
 
@@ -136,6 +135,10 @@ function scopeFlags(flags) {
   return `${flags.custom ? ' --custom' : ''}${flags.workspace ? ` --workspace ${shellQuote(flags.workspace)}` : ''}`;
 }
 
+function discoveryFlags(flags) {
+  return ['workspace', 'space'].filter(key => flags[key]).map(key => ` --${key} ${shellQuote(flags[key])}`).join('');
+}
+
 function named(value, rows, kind, partial = true) {
   if (rows.some(row => !row || typeof row.name !== 'string')) throw new AxiError(`ClickUp returned invalid ${kind} names.`, 'API_RESPONSE');
   let matches = rows.filter(row => fold(row.name) === fold(value) || (row.email && fold(row.email) === fold(value)));
@@ -148,8 +151,8 @@ function named(value, rows, kind, partial = true) {
   ]);
 }
 
-function pageHint(command, flags, page) {
-  const parts = [`clickup-axi ${command}`, `--page ${page}`];
+function pageHint(command, flags, page, bin) {
+  const parts = [`${bin} ${command}`, `--page ${page}`];
   for (const key of ['workspace', 'list', 'space', 'assignee', 'status', 'tag', 'include-closed', 'pages', 'fields']) {
     const value = flags[key];
     if (value !== undefined) parts.push(`--${key}${value === true ? '' : ` ${shellQuote(Array.isArray(value) ? value.join(',') : String(value))}`}`);
@@ -157,11 +160,8 @@ function pageHint(command, flags, page) {
   return parts.join(' ');
 }
 
-function shellQuote(value) {
-  return /^[\w.-]+$/.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`;
-}
-
 export function createApp({ env = process.env, cwd = process.cwd(), fetchImpl = fetch, homeDir, execPath = ENTRY, timeoutMs } = {}) {
+  const bin = invocation(execPath, { env, cwd, homeDir }).command;
   let api;
   let userPromise;
   let teamsPromise;
@@ -176,7 +176,7 @@ export function createApp({ env = process.env, cwd = process.cwd(), fetchImpl = 
     if (selected && isID(selected)) return numericID(selected, 'Workspace ID');
     const rows = await teams();
     if (selected) return numericID(String(named(selected, rows, 'Workspace').id), 'Workspace ID');
-    if (rows.length !== 1) throw new AxiError(`Select a workspace; ${rows.length} are available.`, 'WORKSPACE_REQUIRED', ['Run `clickup-axi workspaces`, then use --workspace <name|id> or set CLICKUP_WORKSPACE_ID.']);
+    if (rows.length !== 1) throw new AxiError(`Select a workspace; ${rows.length} are available.`, 'WORKSPACE_REQUIRED', [`Run \`${bin} workspaces\`, then use --workspace <name|id> or set CLICKUP_WORKSPACE_ID.`]);
     return numericID(String(rows[0].id), 'Workspace ID');
   }
 
@@ -194,22 +194,28 @@ export function createApp({ env = process.env, cwd = process.cwd(), fetchImpl = 
   }
 
   async function folderID(flags) {
+    flags.workspace ??= defaults().workspace;
     if (!isID(flags.folder)) {
       const rows = requireArray(await api('GET', `space/${await spaceID(flags)}/folder`, { archived: false }), 'folders');
       flags.folder = String(named(flags.folder, rows, 'Folder').id);
-    } else if (flags.space) {
-      const space = await spaceID(flags);
+    } else if (flags.space || flags.workspace) {
       const folder = await api('GET', `folder/${flags.folder}`);
+      flags.space ??= numericID(String(folder.space?.id), 'Space ID');
+      const space = await spaceID(flags);
       if (String(folder.space?.id) !== space) usage('The Folder is not in the selected Space.');
     }
     return numericID(flags.folder, 'Folder ID');
   }
 
   async function listID(value, flags) {
+    flags.workspace ??= defaults().workspace;
     if (isID(value)) {
-      if (flags.space) {
-        const space = await spaceID(flags);
+      if (flags.space || flags.workspace) {
         const list = await api('GET', `list/${value}`);
+        const selected = { ...flags, space: flags.space ?? numericID(String(list.space?.id), 'Space ID') };
+        const space = await spaceID(selected);
+        if (flags.space) flags.space = space;
+        if (flags.workspace) flags.workspace = selected.workspace;
         if (String(list.space?.id) !== space) usage('The List is not in the selected Space.');
       }
       return numericID(value, 'List ID');
@@ -230,15 +236,28 @@ export function createApp({ env = process.env, cwd = process.cwd(), fetchImpl = 
     if (fold(value) === 'me') return String(integer(String((await user()).id), 'User ID', 1, Number.MAX_SAFE_INTEGER));
     flags.workspace = await workspace(flags.workspace ?? defaults().workspace);
     const team = (await teams()).find(team => String(team.id) === flags.workspace);
-    if (!team) throw new AxiError('Workspace is not authorized.', 'WORKSPACE_REQUIRED', ['Run `clickup-axi workspaces`.']);
+    if (!team) throw new AxiError('Workspace is not authorized.', 'WORKSPACE_REQUIRED', [`Run \`${bin} workspaces\`.`]);
     const members = requireArray(team, 'members').map(({ user }) => ({ id: user?.id, name: user?.username ?? user?.email, email: user?.email }));
     return String(integer(String(named(value, members, 'Assignee').id), 'User ID', 1, Number.MAX_SAFE_INTEGER));
   }
 
-  async function taskQuery(flags, id) {
-    if (!flags.custom && !/^[A-Za-z][A-Za-z0-9_]*-\d+$/.test(id)) return {};
+  async function taskQuery(flags, id, checkInternal = false) {
+    if (!flags.custom && !/^[A-Za-z][A-Za-z0-9_]*-\d+$/.test(id)) {
+      if (checkInternal && flags.workspace) await readTask(id, flags, {});
+      return {};
+    }
     flags.workspace = await workspace(flags.workspace ?? defaults().workspace);
     return { custom_task_ids: true, team_id: flags.workspace };
+  }
+
+  async function readTask(id, flags, query, extra = {}) {
+    const task = requireTask(await api('GET', `task/${id}`, { ...query, ...extra }));
+    if (flags.workspace && !query.custom_task_ids) {
+      flags.workspace = await workspace(flags.workspace);
+      if (!task.team_id) throw new AxiError('ClickUp did not return the task workspace needed to check --workspace.', 'API_RESPONSE', [`Run \`${bin} task ${shellQuote(id)}\` to inspect the task before retrying. No scoped write was made.`]);
+      if (String(task.team_id) !== flags.workspace) usage('The task is not in the selected workspace.', `Run \`${bin} workspaces\` and select the task's workspace with --workspace <id>.`);
+    }
+    return task;
   }
 
   async function taskList(flags, words) {
@@ -246,7 +265,7 @@ export function createApp({ env = process.env, cwd = process.cwd(), fetchImpl = 
     flags.list ??= config.list;
     flags.assignee ??= 'me';
     flags.workspace ??= config.workspace;
-    if (flags.list) flags.list = await listID(flags.list, flags);
+    if (flags.list) flags.list = isID(flags.list) && !flags.space ? numericID(flags.list, 'List ID') : await listID(flags.list, flags);
     else if (flags.space) await spaceID(flags);
     // A List-only query needs no workspace lookup. An explicit workspace must still constrain the query.
     const listOnly = flags.list && !flags.workspace && !flags.space;
@@ -285,17 +304,17 @@ export function createApp({ env = process.env, cwd = process.cwd(), fetchImpl = 
     const shown = rows.slice(offset, offset + (flags.limit ?? 100));
     const nextOffset = offset + shown.length < rows.length ? offset + shown.length : null;
     const complete = firstPage === 0 && !hasMore;
-    const help = [`Run \`clickup-axi task <id>${scopeFlags(flags)}\` for details.`];
+    const help = shown.length ? [`Run \`${bin} task <id>${scopeFlags(flags)}\` for details.`] : [];
     const command = words === undefined ? 'tasks' : `search ${shellQuote(words)}`;
     if (nextOffset !== null) help.push(words === undefined
-      ? `Run \`${pageHint(command, flags, firstPage)} --limit 100\` for every task on this API page.`
-      : `Run \`${pageHint(command, flags, firstPage)} --offset ${nextOffset}\` for the remaining matches in this scan.`);
-    if (hasMore) help.push(`Run \`${pageHint(command, flags, firstPage + pages)}\` for the next API page.`);
-    if (!rows.length) help.push('Try --include-closed or --assignee all to widen the same scope.');
+      ? `Run \`${pageHint(command, flags, firstPage, bin)} --limit 100\` for every task on this API page.`
+      : `Run \`${pageHint(command, flags, firstPage, bin)} --offset ${nextOffset}\` for the remaining matches in this scan.`);
+    if (hasMore) help.push(`Run \`${pageHint(command, flags, firstPage + pages, bin)}\` for the next API page.`);
+    if (!shown.length) help.push(`Run \`${pageHint(command, { ...flags, assignee: 'all', 'include-closed': true }, firstPage, bin)}\` to widen the same scope.`);
     return {
-      scope: { workspace: flags.workspace ?? null, list: flags.list ?? null, space: flags.space ?? null, assignee: flags.assignee, status: flags.status ?? null, tag: flags.tag ?? null, includeClosed: flags['include-closed'] ?? false },
+      scope: Object.fromEntries(Object.entries({ workspace: flags.workspace, list: flags.list, space: flags.space, assignee: flags.assignee, status: flags.status, tag: flags.tag, includeClosed: flags['include-closed'] ?? false }).filter(([, value]) => value !== undefined)),
       count: shown.length, totalCount: complete ? rows.length : null,
-      matchedInScan: rows.length, scanned, firstPage, pages, hasMore,
+      ...(words === undefined ? { page: firstPage } : { matchedInScan: rows.length, scanned, firstPage, pages }), hasMore,
       ...(hasMore ? { nextPage: firstPage + pages } : {}),
       ...(words === undefined ? {} : { offset, nextOffset }),
       ...(shown.length ? {} : { message: words === undefined ? '0 tasks on this page in this scope.' : `0 matches at this offset in the scanned pages.${hasMore ? ' Unscanned pages may contain matches.' : ''}` }),
@@ -305,7 +324,7 @@ export function createApp({ env = process.env, cwd = process.cwd(), fetchImpl = 
   }
 
   async function commentPage(id, flags, limit = 25, query) {
-    const data = await api('GET', `task/${id}/comment`, { ...(query ?? await taskQuery(flags, id)), start: flags.start, start_id: flags['start-id'] });
+    const data = await api('GET', `task/${id}/comment`, { ...(query ?? await taskQuery(flags, id, true)), start: flags.start, start_id: flags['start-id'] });
     const rows = requireArray(data, 'comments');
     const shown = rows.slice(0, limit);
     const previews = shown.map(comment => preview(comment.comment_text ?? comment.comment?.map(part => part.text ?? '').join(''), flags));
@@ -318,8 +337,8 @@ export function createApp({ env = process.env, cwd = process.cwd(), fetchImpl = 
     }
     const suffix = scopeFlags(flags);
     const help = [];
-    if (next) help.push(`Run \`clickup-axi comments <id>${suffix} --start ${next.start} --start-id ${next.startId}\` for older comments.`);
-    if (previews.some(item => item.truncated)) help.push(`Run \`clickup-axi comments <id>${suffix}${flags.start ? ` --start ${flags.start} --start-id ${flags['start-id']}` : ''} --full\` for complete comment text.`);
+    if (next) help.push(`Run \`${bin} comments ${shellQuote(id)}${suffix} --start ${next.start} --start-id ${next.startId}\` for older comments.`);
+    if (previews.some(item => item.truncated)) help.push(`Run \`${bin} comments ${shellQuote(id)}${suffix}${flags.start ? ` --start ${flags.start} --start-id ${flags['start-id']}` : ''} --full\` for complete comment text.`);
     return {
       count: shown.length, totalCount: !flags.start && !hasMore ? rows.length : null, hasMore, next,
       ...(rows.length ? {} : { message: '0 comments on this page.' }),
@@ -382,23 +401,19 @@ export function createApp({ env = process.env, cwd = process.cwd(), fetchImpl = 
       const config = defaults();
       flags.list ??= config.list;
       flags.workspace ??= config.workspace;
-      if (!flags.list) usage('--list is required, or set a project default.', 'Run `clickup-axi lists --space <id>` to find a List.');
+      if (!flags.list) usage('--list is required, or set a project default.', `Run \`${bin} lists --space <id>\` to find a List.`);
       if (flags.workspace) flags.workspace = await workspace(flags.workspace);
       flags.list = await listID(flags.list, flags);
-      if (flags.workspace && !flags.space) {
-        const list = await api('GET', `list/${flags.list}`);
-        await spaceID({ workspace: flags.workspace, space: numericID(String(list.space?.id), 'Space ID') });
-      }
     }
-    const query = creating ? {} : await taskQuery(flags, id);
+    const query = creating ? {} : await taskQuery(flags, id, command === 'task comment');
     if (command === 'task comment') {
       const body = { comment_text: flags.text, notify_all: flags.notify ?? false };
       if (flags['dry-run']) return { dryRun: true, task: id, body };
       const data = await api('POST', `task/${id}/comment`, query, body);
-      if (!data.id) throw new AxiError('ClickUp did not return a comment ID. The comment may exist.', 'API_RESPONSE', ['Read `clickup-axi comments <id>` before retrying.']);
-      return { action: 'commented', task: id, comment: { id: String(data.id) }, help: [`Run \`clickup-axi comments <id>${scopeFlags(flags)}\` to read comments.`] };
+      if (!data.id) throw new AxiError('ClickUp did not return a comment ID. The comment may exist.', 'API_RESPONSE', [`Read \`${bin} comments <id>\` before retrying.`]);
+      return { action: 'commented', task: id, comment: { id: String(data.id) }, help: [`Run \`${bin} comments ${shellQuote(id)}${scopeFlags(flags)}\` to read comments.`] };
     }
-    const current = creating ? null : requireTask(await api('GET', `task/${id}`, { ...query, include_markdown_description: flags['append-description'] ? true : undefined }));
+    const current = creating ? null : await readTask(id, flags, query, { include_markdown_description: flags['append-description'] ? true : undefined });
     if (current?.team_id) {
       flags.workspace = await workspace(flags.workspace ?? defaults().workspace ?? String(current.team_id));
       if (flags.workspace !== String(current.team_id)) usage('The task is not in the selected workspace.');
@@ -411,7 +426,7 @@ export function createApp({ env = process.env, cwd = process.cwd(), fetchImpl = 
       flags['dry-run'] ||= !flags.yes;
       if (fold(current.status?.type) !== 'closed') {
         const closed = requireArray(await api('GET', `list/${list}`), 'statuses').filter(status => fold(status.type) === 'closed');
-        if (closed.length !== 1 || !closed[0].status) throw new AxiError('The List must have exactly one closed-type status.', 'API_RESPONSE', ['Read `clickup-axi list <id>` and use task update --status to select a status explicitly.']);
+        if (closed.length !== 1 || !closed[0].status) throw new AxiError('The List must have exactly one closed-type status.', 'API_RESPONSE', [`Read \`${bin} list <id>\` and use task update --status to select a status explicitly.`]);
         body.status = closed[0].status;
       }
     } else if (body.status !== undefined) {
@@ -449,7 +464,7 @@ export function createApp({ env = process.env, cwd = process.cwd(), fetchImpl = 
       if (addTags.length) body.tags = addTags;
       if (flags['dry-run']) return { dryRun: true, list, body };
       const task = requireTask(await api('POST', `list/${list}/task`, {}, body));
-      return { action: 'created', task: taskRow(task, FIELDS), help: ['Run `clickup-axi task <id>` for details.'] };
+      return { action: 'created', task: taskRow(task, FIELDS), help: [`Run \`${bin} task ${shellQuote(task.id)}\` for details.`] };
     }
     const description = current.description ?? current.text_content ?? '';
     const existing = { name: current.name, description: description.trim() ? description : '', parent: current.parent, status: current.status?.status, priority: current.priority ? Number(current.priority.id) : null, due_date: current.due_date == null ? null : Number(current.due_date) };
@@ -470,9 +485,9 @@ export function createApp({ env = process.env, cwd = process.cwd(), fetchImpl = 
     ];
     if (Object.keys(body).length) requests.push({ method: 'PUT', path: `task/${id}`, query, body });
     const changed = requests.length > 0;
-    const help = [`Run \`clickup-axi task ${shellQuote(id)}${scopeFlags(flags)}\` for details.`];
-    if (command === 'task close' && changed) help.push(`Closing hides the task from default listings. Run \`clickup-axi task close ${shellQuote(id)}${scopeFlags(flags)} --yes\` only after user approval.`);
-    if (flags['dry-run']) return { dryRun: true, task: { id: current.id, name: current.name }, changed, body, requests, help };
+    const help = [`Run \`${bin} task ${shellQuote(id)}${scopeFlags(flags)}\` for details.`];
+    if (command === 'task close' && changed) help.push(`Closing hides the task from default listings. Run \`${bin} task close ${shellQuote(id)}${scopeFlags(flags)} --yes\` only after user approval.`);
+    if (flags['dry-run']) return { dryRun: true, task: { id: current.id, name: current.name }, changed, requests, ...(command === 'task close' && changed ? { help: help.slice(1) } : {}) };
     let updated = current;
     let completed = 0;
     // Tag endpoints and field updates are separate writes. Do not invent rollback guarantees after an uncertain response.
@@ -489,17 +504,17 @@ export function createApp({ env = process.env, cwd = process.cwd(), fetchImpl = 
       ]);
     }
     if (updated === current && (addTags.length || removeTags.length)) updated = { ...current, tags: [...onTask.filter(tag => !removeTags.includes(tag.name)), ...addTags.map(name => ({ name }))] };
-    return { action: changed ? command === 'task close' ? 'closed' : 'updated' : 'unchanged', changed, task: taskRow(updated, FIELDS), help: help.slice(0, 1) };
+    return { action: changed ? command === 'task close' ? 'closed' : 'updated' : 'unchanged', changed, task: taskRow(updated, FIELDS), ...(changed ? { help: help.slice(0, 1) } : {}) };
   }
 
   async function dispatch(command, argv) {
-    const parsed = parseCommand(command, argv);
+    const parsed = parseCommand(command, argv, bin);
     command = parsed.command;
     const { flags, args } = parsed;
-    if (flags.help) return commandHelp(command);
+    if (flags.help) return commandHelp(command, bin);
     let id = args[0];
-    if (command === 'setup') return setupHooks(id, { cwd, homeDir, execPath, global: flags.global });
-    if (command === 'update') return { message: 'This is a local package; no update was installed.', help: ['In your checkout, run `npm install --ignore-scripts` and `npm install -g .`.'] };
+    if (command === 'setup') return setupHooks(id, { cwd, homeDir, execPath, env, global: flags.global });
+    if (command === 'update') return { message: 'No update was installed. Replace the installed skill directory from the source repository, or reinstall the optional binary from your checkout.' };
     if (command === 'home') {
       const config = defaults();
       const selected = { workspace: flags.workspace ?? config.workspace, list: flags.list ?? config.list, space: flags.space, limit: 5, page: 0 };
@@ -507,18 +522,18 @@ export function createApp({ env = process.env, cwd = process.cwd(), fetchImpl = 
         const tasks = await taskList(selected);
         return { project: config.source, ...tasks };
       }
-      return { ...collection('workspaces', (await teams()).map(team => ({ id: String(team.id), name: team.name }))), help: ['Run `clickup-axi tasks --workspace <id>` for your open tasks.', 'Set workspace and list string IDs in .clickup-axi.json for a project task dashboard.', ...GUIDANCE.slice(-1)] };
+      return { ...collection('workspaces', (await teams()).map(team => ({ id: String(team.id), name: team.name }))), help: [`Run \`${bin} tasks --workspace <id>\` for your open tasks.`, 'Set workspace and list string IDs in .clickup-axi.json for an optional project dashboard.', guidance(bin).at(-1)] };
     }
-    if (command === 'workspaces') return collection('workspaces', (await teams()).map(team => ({ id: String(team.id), name: team.name })), ['Run `clickup-axi spaces --workspace <id>` to find Spaces.']);
+    if (command === 'workspaces') return collection('workspaces', (await teams()).map(team => ({ id: String(team.id), name: team.name })), [`Run \`${bin} spaces --workspace <id>\` to find Spaces.`]);
     if (command === 'members' || command === 'spaces') {
       const selected = await workspace(flags.workspace ?? defaults().workspace);
       if (command === 'members') {
         const team = (await teams()).find(item => String(item.id) === selected);
-        if (!team) throw new AxiError('Workspace is not authorized.', 'WORKSPACE_REQUIRED', ['Run `clickup-axi workspaces`.']);
-        return { workspace: selected, ...collection('members', requireArray(team, 'members').map(({ user }) => ({ id: String(user.id), name: user.username, email: user.email })), [`Run \`clickup-axi tasks --workspace ${selected} --assignee <id>\` to read a member's tasks.`]) };
+        if (!team) throw new AxiError('Workspace is not authorized.', 'WORKSPACE_REQUIRED', [`Run \`${bin} workspaces\`.`]);
+        return { workspace: selected, ...collection('members', requireArray(team, 'members').map(({ user }) => ({ id: String(user.id), name: user.username, email: user.email })), [`Run \`${bin} tasks --workspace ${selected} --assignee <id>\` to read a member's tasks.`]) };
       }
       const data = await api('GET', `team/${selected}/space`, { archived: false });
-      return { workspace: selected, ...collection('spaces', requireArray(data, 'spaces').map(space => ({ id: String(space.id), name: space.name, private: space.private ?? false })), ['Run `clickup-axi folders --space <id>` for Folders.', 'Run `clickup-axi lists --space <id>` for folderless Lists.']) };
+      return { workspace: selected, ...collection('spaces', requireArray(data, 'spaces').map(space => ({ id: String(space.id), name: space.name, private: space.private ?? false })), [`Run \`${bin} folders --space <id> --workspace ${selected}\` for Folders.`, `Run \`${bin} lists --space <id> --workspace ${selected}\` for folderless Lists.`]) };
     }
     if (command === 'tags') return { space: await spaceID(flags), ...collection('tags', await spaceTags(flags.space)) };
     if (command === 'folders' || command === 'lists') {
@@ -527,28 +542,28 @@ export function createApp({ env = process.env, cwd = process.cwd(), fetchImpl = 
       const path = command === 'folders' ? `space/${flags.space}/folder` : flags.folder ? `folder/${flags.folder}/list` : `space/${flags.space}/list`;
       const key = command;
       const data = await api('GET', path, { archived: false });
-      return { scope: flags.folder ? { folder: flags.folder } : { space: flags.space, ...(key === 'lists' ? { folderless: true } : {}) }, ...collection(key, requireArray(data, key).map(item => ({ id: String(item.id), name: item.name, ...(key === 'lists' ? { taskCount: item.task_count == null ? null : Number(item.task_count) } : {}) })), key === 'folders' ? ['Run `clickup-axi lists --folder <id>` for Lists in a Folder.'] : ['Run `clickup-axi list <id>` for allowed statuses.', 'Run `clickup-axi tasks --list <id>` for your open tasks.']) };
+      return { scope: flags.folder ? { folder: flags.folder } : { space: flags.space, ...(key === 'lists' ? { folderless: true } : {}) }, ...collection(key, requireArray(data, key).map(item => ({ id: String(item.id), name: item.name, ...(key === 'lists' ? { taskCount: item.task_count == null ? null : Number(item.task_count) } : {}) })), key === 'folders' ? [`Run \`${bin} lists --folder <id>${discoveryFlags(flags)}\` for Lists in a Folder.`] : [`Run \`${bin} list <id>${discoveryFlags(flags)}\` for allowed statuses; choose a List ID from these results.`, `Run \`${bin} tasks --list <id>${discoveryFlags(flags)}\` for your open tasks; choose a List ID from these results.`]) };
     }
     if (command === 'list') {
       id = await listID(id, flags);
       const data = await api('GET', `list/${id}`);
       const body = preview(data.content, flags);
-      return { list: { id: String(data.id), name: data.name, taskCount: data.task_count == null ? null : Number(data.task_count), description: body.text }, statuses: requireArray(data, 'statuses').map(status => ({ name: status.status, type: status.type })), help: ['Run `clickup-axi task create --list <id> --name "<name>"` to add a task.', ...(body.truncated ? ['Run `clickup-axi list <id> --full` for the full description.'] : [])] };
+      return { list: { id: String(data.id), name: data.name, taskCount: data.task_count == null ? null : Number(data.task_count), description: body.text }, statuses: requireArray(data, 'statuses').map(status => ({ name: status.status, type: status.type })), ...(body.truncated ? { help: [`Run \`${bin} list ${id}${discoveryFlags(flags)} --full\` for the full description.`] } : {}) };
     }
     if (command === 'tasks' || command === 'search') return taskList(flags, command === 'search' ? id : undefined);
     if (command.startsWith('task ')) return taskWrite(command, id, flags);
     if (command === 'comments') return commentPage(id, flags);
     const query = await taskQuery(flags, id);
-    const data = requireTask(await api('GET', `task/${id}`, query));
+    const data = await readTask(id, flags, query);
     const body = preview(data.description ?? data.text_content, flags);
     const comments = await commentPage(id, flags, 5, query);
     const help = [...(comments.help ?? [])];
-    if (body.truncated) help.push(`Run \`clickup-axi task <id>${scopeFlags(flags)} --full\` for the full description.`);
+    if (body.truncated) help.push(`Run \`${bin} task ${shellQuote(id)}${scopeFlags(flags)} --full\` for the full description.`);
     delete comments.help;
     return { task: { ...taskRow(data, FIELDS), list: data.list ? { id: String(data.list.id), name: data.list.name } : null, description: body.text }, comments, ...(help.length ? { help } : {}) };
   }
   async function execute(command, argv = []) {
-    api = createClient({ env, cwd, fetchImpl, timeoutMs });
+    api = createClient({ env, cwd, fetchImpl, timeoutMs, bin });
     userPromise = teamsPromise = undefined;
     return dispatch(command, argv);
   }
@@ -557,14 +572,16 @@ export function createApp({ env = process.env, cwd = process.cwd(), fetchImpl = 
 
 export async function main(argv, options = {}) {
   const stdout = options.stdout ?? process.stdout;
-  if (argv.length === 1 && argv[0] === '--help') return void stdout.write(TOP_LEVEL_HELP);
+  const executable = invocation(options.execPath, options);
+  const bin = executable.command;
+  if (argv.length === 1 && argv[0] === '--help') return void stdout.write(topLevelHelp(bin));
   if (argv.length === 1 && ['-v', '-V', '--version'].includes(argv[0])) return void stdout.write(`${VERSION}\n`);
   try {
     const command = argv[0] ?? 'home';
     if (command.startsWith('-')) usage('Flags must come after the command.');
     if (command.includes(' ')) usage('Unknown command.');
     const result = await createApp(options).execute(command, argv.slice(1));
-    const data = argv.length ? result : { bin: options.execPath ?? ENTRY, description: DESCRIPTION, ...result };
+    const data = argv.length ? result : { bin: executable.display, description: DESCRIPTION, ...result };
     stdout.write(`${renderOutput(data)}\n`);
   } catch (error) {
     const known = error instanceof AxiError;

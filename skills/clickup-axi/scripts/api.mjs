@@ -1,7 +1,8 @@
+import { invocation } from './invocation.mjs';
 import { readFileSync, existsSync, statSync, lstatSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { parseEnv } from 'node:util';
-import { AxiError } from './output.js';
+import { AxiError } from './output.mjs';
 
 function validateToken(token) {
   if (typeof token !== 'string' || !token || token.length > 4096 || /[^\x21-\x7e]/.test(token)) {
@@ -30,7 +31,7 @@ export function readToken(env, cwd) {
   }
 }
 
-export function usage(message, help = 'Run `clickup-axi --help`.') {
+export function usage(message, help = `Run \`${invocation().command} --help\`.`) {
   throw new AxiError(message, 'VALIDATION_ERROR', [help]);
 }
 
@@ -85,7 +86,7 @@ export function requireTask(data) {
   return data;
 }
 
-export function createClient({ env = process.env, cwd = process.cwd(), fetchImpl = fetch, timeoutMs = 15000 } = {}) {
+export function createClient({ env = process.env, cwd = process.cwd(), fetchImpl = fetch, timeoutMs = 15000, bin = invocation().command } = {}) {
   let token;
   return async function request(method, path, query = {}, body, version = 'v2') {
     token ??= readToken(env, cwd);
@@ -119,7 +120,7 @@ export function createClient({ env = process.env, cwd = process.cwd(), fetchImpl
     if (!response.ok) {
       const status = response.status;
       const errors = {
-        400: ['ClickUp rejected the supplied fields.', 'Check IDs and field values. Use `clickup-axi list <id>` to see allowed statuses.'],
+        400: ['ClickUp rejected the supplied fields.', `Check IDs and field values. Use \`${bin} list <id>\` to see allowed statuses.`],
         401: ['ClickUp rejected your API token.', 'Check CLICKUP_API_TOKEN in your environment or .env. A rejected environment token does not select a .env token.'],
         403: ['You do not have access to this ClickUp resource.', 'Check your workspace and resource permissions.'],
         404: ['The ClickUp resource was not found.', 'Check the ID. Custom task IDs require --custom and a workspace.'],

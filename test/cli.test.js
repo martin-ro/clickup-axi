@@ -4,10 +4,11 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, existsSync
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { createApp, main } from '../src/cli.js';
-import { COMMANDS } from '../src/help.js';
-import { createClient, projectConfig, readToken } from '../src/api.js';
-import { VERSION } from '../src/version.js';
+import { createApp, main } from '../skills/clickup-axi/scripts/cli.mjs';
+import { COMMANDS } from '../skills/clickup-axi/scripts/help.mjs';
+import { createClient, projectConfig, readToken } from '../skills/clickup-axi/scripts/api.mjs';
+import { invocation, ENTRY } from '../skills/clickup-axi/scripts/invocation.mjs';
+import { VERSION } from '../skills/clickup-axi/scripts/version.mjs';
 
 const TOKEN = 'pk_test_secret';
 const task = (id = 'abc123', extra = {}) => ({
@@ -93,7 +94,7 @@ test('help for every command works without auth, config, or API calls', async t 
   for (const command of Object.keys(COMMANDS)) {
     const [root, ...args] = command.split(' ');
     const data = await app.execute(root, [...args, '--help']);
-    assert.ok(data.command.startsWith('clickup-axi '));
+    assert.ok(data.command.startsWith(invocation(ENTRY, app.config).command + ' '));
     assert.ok(data.flags['--help']);
   }
   assert.equal(app.calls.length, 0);
@@ -203,7 +204,7 @@ test('tasks are scoped to me, include subtasks, and use exact API array paramete
 test('List-only reads include Tasks in Multiple Lists and avoid workspace lookup', async t => {
   const app = fixture(t, basics);
   const result = await app.execute('tasks', ['--list', '200', '--assignee', 'all', '--fields', 'id,priority,url']);
-  assert.equal(result.scope.workspace, null);
+  assert.equal(result.scope.workspace, undefined);
   assert.equal(app.calls.length, 1);
   assert.equal(app.calls[0].path, 'list/200/task');
   assert.equal(app.calls[0].query.include_timl, 'true');
@@ -216,7 +217,8 @@ test('task pages never present page size as a global total, and preserve filter 
   const result = await app.execute('tasks', ['--workspace', '100', '--assignee', 'all', '--status', "Bob's queue", '--include-closed', '--limit', '2']);
   assert.equal(result.count, 2);
   assert.equal(result.totalCount, null);
-  assert.equal(result.scanned, 100);
+  assert.equal(result.scanned, undefined);
+  assert.equal(result.page, 0);
   assert.equal(result.nextPage, 1);
   assert.ok(result.help.some(hint => hint.includes('--page 1') && hint.includes('--workspace 100') && hint.includes('--include-closed') && hint.includes("'Bob'\\''s queue'")));
 });
@@ -397,7 +399,7 @@ test('explicit Space constraints also validate numeric Lists and Folders', async
 test('assignee names, emails, and me work for writes and resolved conflicts make no write', async t => {
   const app = fixture(t, call => call.path === 'task/abc123' ? task() : hierarchy(call));
   const result = await app.execute('task', ['update', 'abc123', '--assignee', 'ali', '--dry-run']);
-  assert.deepEqual(result.body.assignees, { add: [7], rem: [] });
+  assert.deepEqual(result.requests[0].body.assignees, { add: [7], rem: [] });
   const created = await app.execute('task', ['create', '--list', '200', '--name', 'x', '--assignee', 'me', '--dry-run']);
   assert.deepEqual(created.body.assignees, [7]);
   await assert.rejects(app.execute('task', ['update', 'abc123', '--assignee', 'Alice', '--unassign', 'a@example.test']), { code: 'VALIDATION_ERROR' });
@@ -461,13 +463,13 @@ test('named assignee pagination keeps List-only scope and Tasks in Multiple List
   const app = fixture(t, call => call.path.endsWith('/task') ? { tasks: Array.from({ length: 100 }, (_, i) => task(`t${i}`)) } : basics(call));
   for (const [command, args, cursor] of [['tasks', [], '--page 1'], ['search', ['Fix', '--pages', '1'], '--offset 2']]) {
     const first = await app.execute(command, [...args, '--list', '200', '--assignee', 'Alice', '--limit', '2']);
-    assert.equal(first.scope.workspace, null);
+    assert.equal(first.scope.workspace, undefined);
     const hint = first.help.find(hint => hint.includes(cursor));
     assert.ok(hint);
     assert.ok(!hint.includes('--workspace'));
-    const [, root, ...argv] = hint.match(/`([^`]+)`/)[1].split(' ');
+    const [root, ...argv] = hint.match(/`([^`]+)`/)[1].slice(invocation(ENTRY, app.config).command.length + 1).split(' ');
     const next = await app.execute(root, argv);
-    assert.equal(next.scope.workspace, null);
+    assert.equal(next.scope.workspace, undefined);
     assert.equal(app.calls.at(-1).path, 'list/200/task');
     assert.equal(app.calls.at(-1).query.include_timl, 'true');
   }
@@ -486,7 +488,7 @@ test('parent updates reject self-parenting, cross-List parents, and ancestor cyc
     return current;
   });
   const dry = await app.execute('task', ['update', 'abc123', '--parent', 'parent', '--dry-run']);
-  assert.deepEqual(dry.body, { parent: 'parent' });
+  assert.deepEqual(dry.requests[0].body, { parent: 'parent' });
   assert.equal((await app.execute('task', ['update', 'abc123', '--parent', 'parent'])).changed, true);
   assert.equal((await app.execute('task', ['update', 'abc123', '--parent', 'parent'])).changed, false);
   assert.equal(app.calls.filter(call => call.method === 'PUT').length, 1);
@@ -501,7 +503,7 @@ test('description appends keep Markdown, read in dry runs, and are not idempoten
   });
   const args = ['update', 'abc123', '--append-description=- Added'];
   const dry = await app.execute('task', [...args, '--dry-run']);
-  assert.deepEqual(dry.body, { markdown_content: '**Keep this**\n\n- Added' });
+  assert.deepEqual(dry.requests[0].body, { markdown_content: '**Keep this**\n\n- Added' });
   assert.equal(app.calls.length, 1);
   await app.execute('task', args);
   await app.execute('task', args);
@@ -569,7 +571,7 @@ test('close previews by default, uses closed not done, and --dry-run overrides -
   for (const flags of [[], ['--yes', '--dry-run']]) {
     const result = await app.execute('task', ['close', 'abc123', ...flags]);
     assert.equal(result.dryRun, true);
-    assert.deepEqual(result.body, { status: 'closed' });
+    assert.deepEqual(result.requests[0].body, { status: 'closed' });
     assert.equal(result.task.name, 'Fix login');
   }
   assert.ok(app.calls.every(call => call.method === 'GET'));
@@ -587,6 +589,7 @@ test('close previews by default, uses closed not done, and --dry-run overrides -
 
 test('moves change only the home List with one v3 request and resolve custom task IDs', async t => {
   const app = fixture(t, call => {
+    if (call.path === 'team/100/space') return { spaces: [{ id: '300', name: 'Dev' }] };
     if (call.path === 'list/201') return list('201', { name: 'Next' });
     if (call.version === 'v3') return new Response('');
     return task('abc123');
@@ -609,7 +612,7 @@ test('moves change only the home List with one v3 request and resolve custom tas
 });
 
 test('moves require explicit status remaps and never add a hidden status write', async t => {
-  const app = fixture(t, call => call.path === 'list/201' ? list('201', { statuses: [{ id: 'queue-id', status: 'Queued', type: 'open' }] }) : task());
+  const app = fixture(t, call => call.path === 'team/100/space' ? { spaces: [{ id: '300', name: 'Dev' }] } : call.path === 'list/201' ? list('201', { statuses: [{ id: 'queue-id', status: 'Queued', type: 'open' }] }) : task('abc123', { team_id: '100' }));
   const args = ['move', 'abc123', '--workspace', '100', '--list', '201'];
   await assert.rejects(app.execute('task', args), { code: 'VALIDATION_ERROR' });
   await assert.rejects(app.execute('task', [...args, '--status', 'absent']), { code: 'NAME_NOT_FOUND' });
@@ -617,7 +620,7 @@ test('moves require explicit status remaps and never add a hidden status write',
   assert.deepEqual(dry.body, { status_mappings: [{ source_status: 'open-id', destination_status: 'queue-id' }] });
   assert.equal(dry.status, 'Queued');
   assert.ok(app.calls.every(call => call.method === 'GET'));
-  const kept = fixture(t, call => call.path === 'list/201' ? list('201') : task());
+  const kept = fixture(t, call => call.path === 'team/100/space' ? { spaces: [{ id: '300', name: 'Dev' }] } : call.path === 'list/201' ? list('201') : task('abc123', { team_id: '100' }));
   await assert.rejects(kept.execute('task', [...args, '--status', 'closed']), { code: 'VALIDATION_ERROR' });
   assert.ok(kept.calls.every(call => call.method === 'GET'));
 });
@@ -815,8 +818,85 @@ test('hook setup reports malformed host config instead of overwriting it', async
   assert.equal(readFileSync(path, 'utf8'), 'invalid JSON');
 });
 
-test('hook setup rejects shell-unsafe executable paths without writing files', async t => {
-  const app = fixture(t, undefined, { execPath: resolve('path with spaces/bin/clickup-axi.js') });
-  await assert.rejects(app.execute('setup', ['hooks']), { code: 'VALIDATION_ERROR' });
-  assert.equal(existsSync(join(app.cwd, '.claude')), false);
+test('hook setup safely quotes executable paths with spaces and shell symbols', async t => {
+  const execPath = resolve("path with spaces/Bob's $tools/clickup-axi.mjs");
+  const app = fixture(t, undefined, { execPath });
+  const result = await app.execute('setup', ['hooks']);
+  const hook = JSON.parse(readFileSync(result.claude.path)).hooks.SessionStart[0].hooks[0];
+  assert.equal(hook.command, invocation(execPath, app.config).command + ' # clickup-axi managed');
+  await app.execute('setup', ['remove']);
+  assert.deepEqual(JSON.parse(readFileSync(result.claude.path)), {});
+});
+
+test('numeric List and Folder discovery enforce explicit workspace ownership', async t => {
+  for (const [command, args] of [['list', ['200']], ['lists', ['--folder', '400']]]) {
+    const matching = fixture(t, hierarchy);
+    const result = await matching.execute(command, [...args, '--workspace', 'Work']);
+    assert.ok(result.list || result.lists);
+    assert.ok(matching.calls.some(call => call.path === 'team/100/space'));
+    const wrong = fixture(t, call => call.path === 'team/101/space' ? { spaces: [] } : hierarchy(call));
+    await assert.rejects(wrong.execute(command, [...args, '--workspace', '101']), { code: 'VALIDATION_ERROR' });
+    assert.ok(wrong.calls.every(call => call.method === 'GET'));
+    if (command === 'lists') assert.ok(!wrong.calls.some(call => call.path === 'folder/400/list'));
+  }
+});
+
+test('internal task detail, comments, and comment writes enforce explicit workspace', async t => {
+  const commands = [['task', ['abc123']], ['comments', ['abc123']], ['task', ['comment', 'abc123', '--text', 'Hello']], ['task', ['comment', 'abc123', '--text', 'Hello', '--dry-run']]];
+  for (const [command, args] of commands) {
+    for (const team_id of ['101', undefined]) {
+      const app = fixture(t, () => task('abc123', { team_id }));
+      await assert.rejects(app.execute(command, [...args, '--workspace', '100']), { code: team_id ? 'VALIDATION_ERROR' : 'API_RESPONSE' });
+      assert.deepEqual(app.calls.map(call => call.path), ['task/abc123']);
+      assert.ok(app.calls.every(call => call.method === 'GET'));
+    }
+    const app = fixture(t, call => call.path === 'team' ? basics(call) : call.path.endsWith('/comment') ? call.method === 'GET' ? { comments: [] } : { id: '123' } : task('abc123', { team_id: '100' }));
+    await app.execute(command, [...args, '--workspace', 'Work']);
+    assert.equal(app.calls.filter(call => call.path === 'task/abc123').length, 1);
+    assert.equal(app.calls.filter(call => call.method === 'POST').length, args[0] === 'comment' && !args.includes('--dry-run') ? 1 : 0);
+  }
+});
+
+test('discovery hints carry resolved scope and select List IDs from the Folder inventory', async t => {
+  const app = fixture(t, hierarchy);
+  const spaces = await app.execute('spaces', ['--workspace', 'Work']);
+  assert.ok(spaces.help.every(hint => hint.includes('--workspace 100')));
+  const folders = await app.execute('folders', ['--space', 'Dev', '--workspace', 'Work']);
+  assert.ok(folders.help.every(hint => hint.includes('--space 300') && hint.includes('--workspace 100')));
+  const lists = await app.execute('lists', ['--folder', '400', '--workspace', 'Work']);
+  assert.equal(lists.scope.folder, '400');
+  assert.ok(lists.help.every(hint => hint.includes('--space 300') && hint.includes('--workspace 100') && hint.includes('choose a List ID from these results')));
+  const tasks = await app.execute('tasks', ['--list', '200', '--space', 'Dev', '--workspace', 'Work']);
+  assert.equal(tasks.scope.space, '300');
+  assert.equal(app.calls.at(-1).query['space_ids[]'], '300');
+});
+
+test('default output omits scan-only metadata, null scope, duplicate bodies, and irrelevant hints', async t => {
+  const app = fixture(t, call => call.path.endsWith('/comment') ? { comments: [] } : call.path.endsWith('/task') ? { tasks: [] } : task());
+  const empty = await app.execute('tasks', ['--list', '200', '--assignee', 'all']);
+  assert.deepEqual(empty.scope, { list: '200', assignee: 'all', includeClosed: false });
+  assert.equal(empty.totalCount, 0);
+  for (const key of ['scanned', 'matchedInScan', 'firstPage', 'pages']) assert.ok(!Object.hasOwn(empty, key));
+  assert.ok(empty.help.every(hint => !hint.includes(' task <id>')));
+  assert.ok(empty.help[0].includes('--list 200'));
+  const detail = await app.execute('task', ['abc123']);
+  assert.equal(detail.help, undefined);
+  const noop = await app.execute('task', ['update', 'abc123', '--name', 'Fix login']);
+  assert.equal(noop.help, undefined);
+  const dry = await app.execute('task', ['update', 'abc123', '--name', 'New', '--dry-run']);
+  assert.equal(dry.body, undefined);
+  assert.deepEqual(dry.requests[0].body, { name: 'New' });
+  assert.equal(dry.help, undefined);
+});
+
+test('help invocation changes never rewrite user data or name candidates', async t => {
+  const name = 'clickup-axi `clickup-axi task <id>`';
+  const app = fixture(t, call => call.path === 'team' ? { teams: [{ id: '1', name }, { id: '2', name }] } : { tasks: [task('abc123', { name })] });
+  const data = await app.execute('tasks', ['--list', '200', '--assignee', 'all']);
+  assert.equal(data.tasks[0].name, name);
+  await assert.rejects(app.execute('spaces', ['--workspace', 'clickup-axi']), error => {
+    assert.equal(error.code, 'AMBIGUOUS_NAME');
+    assert.ok(error.suggestions[0].includes(JSON.stringify(name)));
+    return true;
+  });
 });

@@ -3,9 +3,9 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createApp } from '../src/cli.js';
-import { readToken } from '../src/api.js';
-import { renderOutput } from '../src/output.js';
+import { createApp } from '../skills/clickup-axi/scripts/cli.mjs';
+import { readToken } from '../skills/clickup-axi/scripts/api.mjs';
+import { renderOutput } from '../skills/clickup-axi/scripts/output.mjs';
 
 function fixture(t) {
   const cwd = mkdtempSync(join(tmpdir(), 'clickup-axi-native-'));

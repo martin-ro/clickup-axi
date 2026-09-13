@@ -1,36 +1,67 @@
 # clickup-axi
 
-An agent-friendly ClickUp CLI based on the [AXI principles](https://axi.md/).
-It uses the ClickUp REST API and Node.js built-ins only. No external packages,
-other ClickUp CLI, MCP server, daemon, or build step.
+Browse ClickUp workspaces and manage tasks with compact TOON output.
+This [AXI](https://axi.md/) uses Node.js 22+ built-ins and the ClickUp REST API.
+No external packages or separate official ClickUp CLI are needed.
 
-## Run
+## Agent integration
 
-Requires Node.js 22 or later.
+Use opt-in session hooks for project context at session start. Use the self-contained
+skill for on-demand guidance. Choose either, or both. Ordinary commands install neither.
+
+### Session hooks (opt-in)
+
+From your project directory, run the bundled script at its actual install path:
 
 ```sh
-npm ci --ignore-scripts
+node /path/to/clickup-axi/scripts/clickup-axi.mjs setup hooks
+node /path/to/clickup-axi/scripts/clickup-axi.mjs setup status
+node /path/to/clickup-axi/scripts/clickup-axi.mjs setup remove
+```
+
+Use `--global` for user scope instead of project scope. Install hooks only when asked.
+
+Setup uses Node.js built-ins to install Claude Code and Codex `SessionStart` hooks
+and an OpenCode context plugin. It updates their configuration files only on
+explicit setup. Repeated setup is a no-op when paths and settings are unchanged.
+
+Project setup writes `.claude/settings.json`, `.codex/hooks.json`, and a managed
+plugin under `.opencode/plugins/`. It also enables `[features].hooks = true` in
+**`~/.codex/config.toml`**, even for project setup. User setup uses the equivalent
+user directories. Removing hooks leaves this shared Codex feature flag enabled.
+Existing unrelated hook entries are kept. Setup reports partial failures.
+Complex TOML requires manual configuration of the Codex feature flag; setup does
+not try to parse it. Status reports `null` when the flag cannot be verified.
+Unrecognized OpenCode plugin files are not replaced or removed.
+
+Hooks run the content-first home view with a 10-second host timeout. The host must
+have access to `CLICKUP_API_TOKEN` in its environment or the project's `.env`.
+Hooks use a verified PATH binary only when it resolves to this executable. Otherwise
+they use safely quoted Node and script paths. Setup repairs moved paths. Shell hooks
+use POSIX quoting; real Windows shells have not been tested.
+The OpenCode plugin caches context once per session.
+
+### Self-contained skill
+
+Install the complete [`skills/clickup-axi`](skills/clickup-axi) directory through your
+agent's skill loader. It includes `SKILL.md` and the runnable `scripts/*.mjs` files.
+No checkout, npm install, `node_modules`, or global binary is needed on that machine.
+Keep the user's project as cwd, not the skill directory. Node.js 22+ and a token are
+required. Project config is optional. The skill is generated from the static home
+and help guidance in `skills/clickup-axi/scripts/help.mjs` and checked for drift.
+No session-end transcript capture is implemented.
+
+## Run from a checkout
+
+```sh
 node bin/clickup-axi.js --help
+node bin/clickup-axi.js             # workspaces, or scoped project tasks
+node bin/clickup-axi.js tasks --help
 ```
 
-Set `CLICKUP_API_TOKEN` in your environment or local `.env`.
-Create a personal token in **ClickUp Settings > Apps**.
-Never paste tokens into agent conversations, command arguments, or tracked files.
-
-```sh
-node bin/clickup-axi.js             # accessible workspaces, or scoped project tasks
-node bin/clickup-axi.js tasks       # your open tasks in the only available workspace
-```
-
-For a local installation:
-
-```sh
-npm install -g .
-clickup-axi --version
-```
-
-This package is private and unpublished. Install from this checkout, not from an
-unrelated `clickup-axi` package. No commands check for updates or install packages.
+Optional local binary installation is `npm install -g .`. Then `clickup-axi` uses the
+same bundled runtime. This package is private and unpublished. Do not install an
+unrelated package with that name. No command installs packages or checks for updates.
 
 ## Authentication
 
@@ -53,46 +84,17 @@ ASCII characters without spaces. An unreadable, non-regular, or oversized `.env`
 file fails instead of silently selecting an ancestor's token. The size limit is
 1 MiB. Use `clickup-axi workspaces` to check access with a GET request.
 
-## Common commands
+## Commands
 
-Put flags **after** the command. Every command supports `--help` without credentials.
+Put flags after the command. Every command supports `--help` without credentials or
+project config reads. Help and follow-up hints show a runnable invocation, with a
+verified binary or the actual Node and script paths.
 
 ```sh
-clickup-axi workspaces
-clickup-axi spaces --workspace 100
-clickup-axi folders --space 300
-clickup-axi lists --space 300       # folderless Lists only
-clickup-axi lists --folder 400      # Lists inside this Folder
-clickup-axi list 200                # description, task count, allowed statuses
-clickup-axi members --workspace 100
-clickup-axi tags --space "Development"
-
-clickup-axi tasks --workspace 100
-clickup-axi tasks --list 200 --assignee all
-clickup-axi tasks --list "Sprint" --space "Development" --assignee "Alice"
-clickup-axi tasks --workspace 100 --assignee 7 --status "in progress"
-clickup-axi tasks --list 200 --fields id,name,priority,assignees,due_date
-clickup-axi search "login redirect" --list 200 --include-closed
-clickup-axi task abc123
-clickup-axi task PROJ-42 --workspace 100
-clickup-axi task abc123 --full
-clickup-axi comments abc123
-
-clickup-axi task create --list 200 --name "Fix login" --description "Check redirects"
-clickup-axi task create --list 200 --name "Add a check" --parent abc123
-clickup-axi task update abc123 --status "in progress" --priority high
-clickup-axi task update abc123 --assignee 7 --unassign 8 --dry-run
-clickup-axi task update abc123 --due 2026-12-01
-clickup-axi task update abc123 --due none --description ""
-clickup-axi task comment abc123 --text "Ready for review"
-clickup-axi task create --list "Sprint" --space "Development" --name "Fix login" --tag bug
-clickup-axi task update abc123 --add-tag bug --add-tag backend --remove-tag duplicate
-clickup-axi task update abc123 --parent def456 --dry-run
-clickup-axi task update abc123 --append-description="- Add a regression check"
-clickup-axi task move abc123 --list "Next sprint" --space "Development" --dry-run
-clickup-axi task move abc123 --list 201 --status "to do" --dry-run
-clickup-axi task close abc123       # preview only
-clickup-axi task close abc123 --yes # writes after user approval
+node bin/clickup-axi.js workspaces
+node bin/clickup-axi.js tasks --list 200 --assignee all
+node bin/clickup-axi.js task abc123
+node bin/clickup-axi.js task update --help
 ```
 
 Workspaces, Spaces, Folders, Lists, and assignees accept names or IDs. Lookup uses
@@ -100,7 +102,9 @@ case-insensitive exact matches first, then a unique name substring. Assignees al
 accept exact email addresses and `me`. Ambiguous names fail with candidate IDs.
 List and Folder names require `--space`. List lookup checks folderless Lists and
 all active Folders in that Space. It never uses a partial inventory after an error.
-Numeric IDs avoid name discovery. Project and environment defaults remain IDs.
+Numeric IDs avoid name discovery. Explicit workspace and Space scopes still check
+ownership. Internal task IDs with --workspace require a task read before comments
+or comment writes. Missing ownership data fails closed. Project defaults remain IDs.
 
 Tasks still require IDs, not titles. `PREFIX-123` custom IDs are detected automatically;
 use `--custom` for other custom-ID formats. Custom IDs require a selected workspace.
@@ -151,7 +155,8 @@ Invalid Unicode surrogates fail instead of changing text. There is no format lib
   hidden rows on that page before moving to the next page.
 - Search matches every word against task names and descriptions. It scans at most
   five API pages by default. `--pages` changes this bound, up to 100 pages.
-- `scanned`, `matchedInScan`, `hasMore`, and `nextPage` describe the scan. Search
+- Ordinary task lists return `page`, `hasMore`, and, when needed, `nextPage`.
+  Search also returns `scanned`, `matchedInScan`, `firstPage`, and `pages`. Search
   `--offset` displays the remaining matches in the same scan window. Each command
   reads live data again; pagination is not a snapshot.
 - `hasMore` is conservative for a full page if ClickUp supplies no last-page flag.
@@ -161,6 +166,9 @@ Invalid Unicode surrogates fail instead of changing text. There is no format lib
 - Descriptions and comment text default to 1,000 Unicode characters. Previews state
   the full size. `--max-chars` changes the bound; `--full` restores text, not pages.
 
+Unset scope fields and search-only metadata are omitted from ordinary task lists.
+Update and close previews contain each request body once, under `requests`.
+Self-contained detail and no-op results omit unrelated next steps.
 Empty results are explicit. Errors are structured on stdout. Exit codes are
 `0` for success, `1` for API or setup failure, and `2` for invalid input.
 Unknown flags, duplicate non-repeatable flags, and extra arguments fail before API access.
@@ -206,58 +214,19 @@ Unknown flags, duplicate non-repeatable flags, and extra arguments fail before A
   API origin. Redirects are rejected. Raw error bodies are never printed.
 - There are no task-delete commands, automatic status remaps, or background writes.
 
-## Agent integration
-
-Session hooks are the primary integration. Install them only when wanted:
-
-```sh
-clickup-axi setup hooks             # current project
-clickup-axi setup status
-clickup-axi setup remove
-
-clickup-axi setup hooks --global    # user scope
-clickup-axi setup remove --global
-```
-
-Setup uses Node.js built-ins to install Claude Code and Codex `SessionStart` hooks
-and an OpenCode context plugin. It updates their configuration files only on
-explicit setup. Repeated setup is a no-op when paths and settings are unchanged.
-
-Project setup writes `.claude/settings.json`, `.codex/hooks.json`, and a managed
-plugin under `.opencode/plugins/`. It also enables `[features].hooks = true` in
-**`~/.codex/config.toml`**, even for project setup. User setup uses the equivalent
-user directories. Removing hooks leaves this shared Codex feature flag enabled.
-Existing unrelated hook entries are kept. Setup reports partial failures.
-Complex TOML requires manual configuration of the Codex feature flag; setup does
-not try to parse it. Status reports `null` when the flag cannot be verified.
-Unrecognized OpenCode plugin files are not replaced or removed.
-
-Hooks run the content-first home view with a 10-second host timeout. The host must
-have access to `CLICKUP_API_TOKEN` in its environment or the project's `.env`.
-Use stable Node and CLI install paths without spaces or shell symbols.
-The OpenCode plugin caches context once per session.
-
-For on-demand guidance instead of session hooks, install
-[`skills/clickup-axi/SKILL.md`](skills/clickup-axi/SKILL.md) through your agent's
-skill loader. No skill-install package is needed.
-
-The skill uses the locally installed binary. Its guidance is generated from
-`src/help.js` and checked in CI. You can use hooks, the skill, or both.
-
 ## Development
 
 ```sh
-npm run skill     # regenerate the skill after guidance changes
-npm run check     # skill consistency and offline tests
+npm run skill     # regenerate skill guidance and the leaf version module
+npm run check     # generated-file checks and offline tests
 npm pack --dry-run
 ```
 
-Offline tests use fake API responses and temporary config directories. They do
-not read real credentials or change live ClickUp data. They cover token lookup,
-TOON output, command validation, task operations, and hook file changes.
-Earlier live checks covered discovery, tasks, search, comments, name lookup, write
-previews, and sorting. Request guards blocked all live writes. Live mutations and
-real agent-host hook execution have not been tested. No real hooks were installed.
+Offline tests use fake API responses, copied skill directories, and fake homes and
+projects. They do not use real credentials, live ClickUp data, or actual user hooks.
+Version latency is checked against the Node console.log startup floor. The tested
+runtime is Node.js 24.18.0; Node 22 is the declared minimum, not a tested host here.
+Live mutations and real agent-host hook execution were not tested in this refactor.
 
-This first version does not cover Docs, time tracking, custom-field writes,
-attachments, bulk operations, or OAuth login flows.
+This version does not cover Docs, time tracking, custom-field writes, attachments,
+bulk operations, or OAuth login flows.
