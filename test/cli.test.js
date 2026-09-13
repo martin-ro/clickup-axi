@@ -6,14 +6,17 @@ import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createApp, main } from '../src/cli.js';
 import { COMMANDS } from '../src/help.js';
-import { createClient, projectConfig } from '../src/api.js';
+import { createClient, projectConfig, readToken } from '../src/api.js';
 import { VERSION } from '../src/version.js';
 
 const TOKEN = 'pk_test_secret';
 const task = (id = 'abc123', extra = {}) => ({
-  id, name: 'Fix login', status: { status: 'open' }, description: 'Check redirects',
-  list: { id: '200', name: 'Sprint' }, priority: null, due_date: null, assignees: [], ...extra,
+  id, name: 'Fix login', status: { id: 'open-id', status: 'open', type: 'open' }, description: 'Check redirects',
+  list: { id: '200', name: 'Sprint' }, space: { id: '300' }, parent: null, tags: [], priority: null, due_date: null, assignees: [], ...extra,
 });
+const list = (id = '200', extra = {}) => ({ id, name: 'Sprint', space: { id: '300' }, statuses: [
+  { id: 'open-id', status: 'open', type: 'open' }, { id: 'done-id', status: 'done', type: 'done' }, { id: 'closed-id', status: 'closed', type: 'closed' },
+], ...extra });
 const comment = n => ({ id: String(n), date: String(1700000000000 + n), user: { username: 'Alice' }, comment_text: `Note ${n}` });
 
 function fixture(t, handler = () => assert.fail('Unexpected API call'), options = {}) {
@@ -27,7 +30,7 @@ function fixture(t, handler = () => assert.fail('Unexpected API call'), options 
       assert.equal(init.headers.Authorization, TOKEN);
       assert.equal(init.redirect, 'error');
       assert.ok(init.signal instanceof AbortSignal);
-      const call = { path: url.pathname.replace('/api/v2/', ''), query: Object.fromEntries(url.searchParams), method: init.method, body: init.body && JSON.parse(init.body) };
+      const call = { version: url.pathname.split('/')[2], path: url.pathname.replace(/^\/api\/v[23]\//, ''), query: Object.fromEntries(url.searchParams), method: init.method, body: init.body && JSON.parse(init.body) };
       calls.push(call);
       const data = await handler(call);
       return data instanceof Response ? data : Response.json(data);
@@ -66,7 +69,14 @@ test('strict input validation happens before all API calls', async t => {
     ['task', ['update', 'abc123', '--due', '2025-02-29']], ['task', ['update', 'abc123', '--priority', 'highest']],
     ['task', ['update', 'abc123', '--assignee', '7', '--unassign', '7']],
     ['task', ['comment', 'abc123']], ['task', ['abc123', '--status', 'open']],
-    ['task', ['../abc123']], ['folders', []], ['lists', ['--space', '1', '--folder', '2']],
+    ['task', ['../abc123']], ['folders', []], ['lists', ['--folder', 'Sprints']],
+    ['tags', []], ['list', ['Sprint']], ['task', ['move', 'abc123']], ['task', ['close']],
+    ['task', ['update', 'abc123', '--parent', 'none']],
+    ['task', ['update', 'abc123', '--description', 'x', '--append-description', 'y']],
+    ['task', ['update', 'abc123', '--add-tag', 'bug', '--remove-tag', 'BUG']],
+    ['task', ['create', '--list', '200', '--name', 'x', '--tag', '..']],
+    ['task', ['update', 'abc123', '--add-tag', 'x\ny']],
+    ['tasks', ['--workspace', 'Work\n']], ['task', ['create', '--list', 'Sprint', '--name', 'x']],
     ['comments', ['abc123', '--start', '123']], ['comments', ['abc123', '--start-id', '1']],
     ['search', ['   ']], ['setup', ['login']], ['workspaces', ['--workspace', '1']],
   ];
@@ -79,6 +89,7 @@ test('strict input validation happens before all API calls', async t => {
 test('help for every command works without auth, config, or API calls', async t => {
   const app = fixture(t, undefined, { env: {} });
   writeFileSync(join(app.cwd, '.clickup-axi.json'), 'invalid');
+  mkdirSync(join(app.cwd, '.env'));
   for (const command of Object.keys(COMMANDS)) {
     const [root, ...args] = command.split(' ');
     const data = await app.execute(root, [...args, '--help']);
@@ -98,7 +109,7 @@ test('entrypoint version aliases and help run without credentials', () => {
   }
 });
 
-test('SDK boundary returns structured usage errors, including prototype names', async t => {
+test('CLI boundary returns structured usage errors, including prototype names', async t => {
   const app = fixture(t);
   for (const args of [['tasks', '--invented'], ['missing-command'], ['__proto__'], ['constructor'], ['--workspace', '100']]) {
     const result = await output(args, app.config);
@@ -186,7 +197,7 @@ test('tasks are scoped to me, include subtasks, and use exact API array paramete
   const result = await app.execute('tasks', ['--status', 'in review', '--tag', 'a,b']);
   assert.equal(result.totalCount, 1);
   assert.deepEqual(Object.keys(result.tasks[0]), ['id', 'name', 'status', 'list']);
-  assert.deepEqual(app.calls.at(-1).query, { subtasks: 'true', include_closed: 'false', order_by: 'updated', reverse: 'true', 'assignees[]': '7', 'statuses[]': 'in review', 'tags[]': 'a,b', page: '0' });
+  assert.deepEqual(app.calls.at(-1).query, { subtasks: 'true', include_closed: 'false', order_by: 'updated', reverse: 'false', 'assignees[]': '7', 'statuses[]': 'in review', 'tags[]': 'a,b', page: '0' });
 });
 
 test('List-only reads include Tasks in Multiple Lists and avoid workspace lookup', async t => {
@@ -271,6 +282,7 @@ test('comments carry both cursors and give exact totals only for the complete fi
 test('updates are idempotent and return the mutation response without a follow-up read', async t => {
   let current = task('abc123');
   const app = fixture(t, call => {
+    if (call.path === 'list/200') return list();
     if (call.method === 'PUT') current = { ...current, status: { status: call.body.status } };
     return current;
   });
@@ -279,7 +291,7 @@ test('updates are idempotent and return the mutation response without a follow-u
   assert.equal(first.task.status, 'closed');
   const second = await app.execute('task', ['update', 'abc123', '--status', 'closed']);
   assert.equal(second.action, 'unchanged');
-  assert.deepEqual(app.calls.map(call => call.method), ['GET', 'PUT', 'GET']);
+  assert.deepEqual(app.calls.map(call => call.method), ['GET', 'GET', 'PUT', 'GET']);
 });
 
 test('updates map due dates, clear values, and add/remove assignees in one write', async t => {
@@ -311,15 +323,15 @@ test('already matching dates, priority, and assignees produce no write', async t
 
 test('dry runs never write and creation validates a target List before any API call', async t => {
   const app = fixture(t, () => task(), { env: {} });
-  const created = await app.execute('task', ['create', '--name', 'New', '--list', '200', '--parent', 'abc123', '--assignee', '7', '--dry-run']);
-  assert.deepEqual(created.body, { name: 'New', parent: 'abc123', assignees: [7] });
+  const created = await app.execute('task', ['create', '--name', 'New', '--list', '200', '--assignee', '7', '--dry-run']);
+  assert.deepEqual(created.body, { name: 'New', assignees: [7] });
   const commented = await app.execute('task', ['comment', 'abc123', '--text', 'Hello', '--dry-run']);
   assert.deepEqual(commented.body, { comment_text: 'Hello', notify_all: false });
   await assert.rejects(app.execute('task', ['create', '--name', 'New']), { code: 'VALIDATION_ERROR' });
   assert.equal(app.calls.length, 0);
-  const normal = fixture(t, () => task());
+  const normal = fixture(t, call => call.path === 'list/200' ? list() : task());
   assert.equal((await normal.execute('task', ['update', 'abc123', '--status', 'closed', '--dry-run'])).changed, true);
-  assert.deepEqual(normal.calls.map(call => call.method), ['GET']);
+  assert.deepEqual(normal.calls.map(call => call.method), ['GET', 'GET']);
 });
 
 test('create and comment write once and do not send notifications unless requested', async t => {
@@ -328,6 +340,396 @@ test('create and comment write once and do not send notifications unless request
   assert.equal((await app.execute('task', ['comment', 'abc123', '--text', 'Hello'])).comment.id, '123');
   assert.deepEqual(app.calls.map(call => call.method), ['POST', 'POST']);
   assert.deepEqual(app.calls[1].body, { comment_text: 'Hello', notify_all: false });
+});
+
+function hierarchy(call) {
+  const data = {
+    'team/100/space': { spaces: [{ id: '300', name: 'Dev' }, { id: '301', name: 'Development' }] },
+    'space/300/folder': { folders: [{ id: '400', name: 'Sprints' }] },
+    'space/300/list': { lists: [{ id: '202', name: 'Inbox' }] },
+    'folder/400/list': { lists: [list()] },
+    'folder/400': { id: '400', space: { id: '300' } },
+    'list/200': list(),
+    'space/300/tag': { tags: [{ name: 'Bug' }, { name: 'a,b' }] },
+  };
+  return data[call.path] ?? basics(call);
+}
+
+test('names resolve through the hierarchy, with exact matches before unique substrings', async t => {
+  const app = fixture(t, hierarchy);
+  assert.equal((await app.execute('spaces', ['--workspace', 'wo'])).workspace, '100');
+  assert.equal((await app.execute('folders', ['--space', 'dev', '--workspace', 'Work'])).scope.space, '300');
+  assert.equal((await app.execute('lists', ['--folder', 'sprint', '--space', 'Dev'])).scope.folder, '400');
+  assert.equal((await app.execute('list', ['Sprint', '--space', 'Dev'])).list.id, '200');
+  assert.equal((await app.execute('tags', ['--space', 'Dev'])).tags[0].name, 'Bug');
+  const result = await app.execute('tasks', ['--list', 'Sprint', '--space', 'Dev', '--assignee', 'a@example.test']);
+  assert.equal(result.scope.list, '200');
+  assert.equal(app.calls.at(-1).query['assignees[]'], '7');
+  assert.equal(app.calls.at(-1).query['space_ids[]'], '300');
+  assert.equal(app.calls.at(-1).query['list_ids[]'], '200');
+  assert.ok(app.calls.every(call => call.method === 'GET'));
+});
+
+test('duplicate names fail with candidate IDs and Folder context, and partial inventories fail closed', async t => {
+  const app = fixture(t, call => call.path === 'space/300/list' ? { lists: [{ id: '202', name: 'Sprint' }] } : hierarchy(call));
+  await assert.rejects(app.execute('task', ['create', '--name', 'x', '--list', 'sprint', '--space', 'Dev']), error => {
+    assert.equal(error.code, 'AMBIGUOUS_NAME');
+    assert.match(error.suggestions[0], /202.*folderless.*200.*Sprints/);
+    return true;
+  });
+  await assert.rejects(app.execute('folders', ['--space', 'de']), { code: 'AMBIGUOUS_NAME' });
+  await assert.rejects(app.execute('list', ['absent', '--space', '300']), { code: 'NAME_NOT_FOUND' });
+  const broken = fixture(t, call => call.path === 'folder/400/list' ? new Response('', { status: 403 }) : hierarchy(call));
+  await assert.rejects(broken.execute('task', ['create', '--name', 'x', '--list', 'Inbox', '--space', '300']), { code: 'HTTP_403' });
+  assert.ok([...app.calls, ...broken.calls].every(call => call.method === 'GET'));
+});
+
+test('explicit Space constraints also validate numeric Lists and Folders', async t => {
+  const app = fixture(t, hierarchy);
+  for (const [command, args] of [
+    ['task', ['create', '--name', 'x', '--list', '200', '--space', '301']],
+    ['tasks', ['--list', '200', '--space', '301']],
+    ['lists', ['--folder', '400', '--space', '301']],
+  ]) await assert.rejects(app.execute(command, args), { code: 'VALIDATION_ERROR' });
+  assert.ok(app.calls.every(call => call.method === 'GET'));
+});
+
+test('assignee names, emails, and me work for writes and resolved conflicts make no write', async t => {
+  const app = fixture(t, call => call.path === 'task/abc123' ? task() : hierarchy(call));
+  const result = await app.execute('task', ['update', 'abc123', '--assignee', 'ali', '--dry-run']);
+  assert.deepEqual(result.body.assignees, { add: [7], rem: [] });
+  const created = await app.execute('task', ['create', '--list', '200', '--name', 'x', '--assignee', 'me', '--dry-run']);
+  assert.deepEqual(created.body.assignees, [7]);
+  await assert.rejects(app.execute('task', ['update', 'abc123', '--assignee', 'Alice', '--unassign', 'a@example.test']), { code: 'VALIDATION_ERROR' });
+  await assert.rejects(app.execute('task', ['update', 'abc123', '--assignee', 'unknown']), { code: 'NAME_NOT_FOUND' });
+  assert.ok(app.calls.every(call => call.method === 'GET'));
+  const ambiguous = fixture(t, call => call.path === 'team' ? { teams: [{ id: '100', name: 'Work', members: [
+    { user: { id: 7, username: 'Alice' } }, { user: { id: 8, username: 'Alicia' } },
+  ] }] } : hierarchy(call));
+  await assert.rejects(ambiguous.execute('tasks', ['--assignee', 'ali']), { code: 'AMBIGUOUS_NAME' });
+  await ambiguous.execute('tasks', ['--assignee', 'Alice']);
+  assert.equal(ambiguous.calls.at(-1).query['assignees[]'], '7');
+});
+
+test('PREFIX-number custom IDs are detected on task and comment paths', async t => {
+  const app = fixture(t, call => call.path === 'team' ? basics(call) : call.path.endsWith('/comment') ? { comments: [] } : task());
+  await app.execute('task', ['PROJ-42']);
+  await app.execute('comments', ['PROJ-42']);
+  await app.execute('task', ['comment', 'PROJ-42', '--text', 'x', '--dry-run']);
+  await app.execute('task', ['update', 'PROJ-42', '--name', 'New', '--dry-run']);
+  assert.ok(app.calls.filter(call => call.path !== 'team').every(call => call.query.custom_task_ids === 'true' && call.query.team_id === '100'));
+  assert.ok(app.calls.every(call => call.method === 'GET'));
+});
+
+test('create validates names, parent, status, and tags before one write', async t => {
+  const app = fixture(t, call => call.path === 'task/PROJ-42' ? task('parent') : call.method === 'POST' ? task('new') : hierarchy(call));
+  const args = ['create', '--name', 'x', '--list', 'Sprint', '--space', 'Dev', '--status', 'OPEN', '--parent', 'PROJ-42', '--assignee', 'Alice', '--tag', 'bug', '--tag', 'a,b', '--tag', 'BUG'];
+  const dry = await app.execute('task', [...args, '--dry-run']);
+  assert.deepEqual(dry.body, { name: 'x', status: 'open', parent: 'parent', assignees: [7], tags: ['Bug', 'a,b'] });
+  assert.equal(app.calls.find(call => call.path === 'task/PROJ-42').query.custom_task_ids, 'true');
+  assert.ok(app.calls.every(call => call.method === 'GET'));
+  await app.execute('task', args);
+  assert.equal(app.calls.filter(call => call.method !== 'GET').length, 1);
+  assert.deepEqual(app.calls.at(-1).body, dry.body);
+  assert.equal(app.calls.at(-1).path, 'list/200/task');
+});
+
+test('creation rejects missing, ambiguous, and mismatched workspace selections before any write', async t => {
+  for (const lists of [['--list', '200'], ['--list', 'Sprint', '--space', '300']]) {
+    const ambiguous = fixture(t, () => ({ teams: [{ id: '100', name: 'Work A' }, { id: '101', name: 'Work B' }] }));
+    await assert.rejects(ambiguous.execute('task', ['create', '--name', 'x', '--workspace', 'Work', ...lists]), { code: 'AMBIGUOUS_NAME' });
+    assert.deepEqual(ambiguous.calls.map(call => call.path), ['team']);
+    const missing = fixture(t, hierarchy);
+    await assert.rejects(missing.execute('task', ['create', '--name', 'x', '--workspace', 'Absent', ...lists]), { code: 'NAME_NOT_FOUND' });
+    const mismatch = fixture(t, call => call.path === 'team/100/space' ? { spaces: [{ id: '301', name: 'Other' }] } : hierarchy(call));
+    await assert.rejects(mismatch.execute('task', ['create', '--name', 'x', '--workspace', 'Work', ...lists]), { code: 'VALIDATION_ERROR' });
+    assert.ok([...missing.calls, ...mismatch.calls].every(call => call.method === 'GET'));
+  }
+  const app = fixture(t, call => call.method === 'POST' ? task('new') : call.path === 'team/101/space' ? { spaces: [] } : hierarchy(call), { env: { CLICKUP_API_TOKEN: TOKEN, CLICKUP_WORKSPACE_ID: '101' } });
+  writeFileSync(join(app.cwd, '.clickup-axi.json'), JSON.stringify({ workspace: '102', list: '200' }));
+  assert.equal((await app.execute('task', ['create', '--name', 'x', '--workspace', 'Work'])).action, 'created');
+  assert.ok(app.calls.some(call => call.path === 'team/100/space'));
+  await assert.rejects(app.execute('task', ['create', '--name', 'x']), { code: 'VALIDATION_ERROR' });
+  assert.equal(app.calls.filter(call => call.method !== 'GET').length, 1);
+  const project = fixture(t, call => call.path === 'team/102/space' ? { spaces: [] } : hierarchy(call));
+  writeFileSync(join(project.cwd, '.clickup-axi.json'), JSON.stringify({ workspace: '102', list: '200' }));
+  await assert.rejects(project.execute('task', ['create', '--name', 'x', '--dry-run']), { code: 'VALIDATION_ERROR' });
+  assert.ok(project.calls.every(call => call.method === 'GET'));
+});
+
+test('named assignee pagination keeps List-only scope and Tasks in Multiple Lists', async t => {
+  const app = fixture(t, call => call.path.endsWith('/task') ? { tasks: Array.from({ length: 100 }, (_, i) => task(`t${i}`)) } : basics(call));
+  for (const [command, args, cursor] of [['tasks', [], '--page 1'], ['search', ['Fix', '--pages', '1'], '--offset 2']]) {
+    const first = await app.execute(command, [...args, '--list', '200', '--assignee', 'Alice', '--limit', '2']);
+    assert.equal(first.scope.workspace, null);
+    const hint = first.help.find(hint => hint.includes(cursor));
+    assert.ok(hint);
+    assert.ok(!hint.includes('--workspace'));
+    const [, root, ...argv] = hint.match(/`([^`]+)`/)[1].split(' ');
+    const next = await app.execute(root, argv);
+    assert.equal(next.scope.workspace, null);
+    assert.equal(app.calls.at(-1).path, 'list/200/task');
+    assert.equal(app.calls.at(-1).query.include_timl, 'true');
+  }
+});
+
+test('parent updates reject self-parenting, cross-List parents, and ancestor cycles', async t => {
+  for (const parent of [task('abc123'), task('parent', { list: { id: '201' } }), task('parent', { parent: 'child' })]) {
+    const app = fixture(t, call => call.path === 'task/parent' ? parent : call.path === 'task/child' ? task('child', { parent: 'abc123' }) : task());
+    await assert.rejects(app.execute('task', ['update', 'abc123', '--parent', 'parent', '--name', 'New']), { code: 'VALIDATION_ERROR' });
+    assert.ok(app.calls.every(call => call.method === 'GET'));
+  }
+  let current = task();
+  const app = fixture(t, call => {
+    if (call.path === 'task/parent') return task('parent');
+    if (call.method === 'PUT') current = { ...current, ...call.body };
+    return current;
+  });
+  const dry = await app.execute('task', ['update', 'abc123', '--parent', 'parent', '--dry-run']);
+  assert.deepEqual(dry.body, { parent: 'parent' });
+  assert.equal((await app.execute('task', ['update', 'abc123', '--parent', 'parent'])).changed, true);
+  assert.equal((await app.execute('task', ['update', 'abc123', '--parent', 'parent'])).changed, false);
+  assert.equal(app.calls.filter(call => call.method === 'PUT').length, 1);
+});
+
+test('description appends keep Markdown, read in dry runs, and are not idempotent', async t => {
+  let current = task('abc123', { markdown_description: '**Keep this**' });
+  const app = fixture(t, call => {
+    if (call.method === 'GET') assert.equal(call.query.include_markdown_description, 'true');
+    else current = { ...current, markdown_description: call.body.markdown_content };
+    return current;
+  });
+  const args = ['update', 'abc123', '--append-description=- Added'];
+  const dry = await app.execute('task', [...args, '--dry-run']);
+  assert.deepEqual(dry.body, { markdown_content: '**Keep this**\n\n- Added' });
+  assert.equal(app.calls.length, 1);
+  await app.execute('task', args);
+  await app.execute('task', args);
+  assert.equal(current.markdown_description, '**Keep this**\n\n- Added\n\n- Added');
+  const missing = fixture(t, () => task());
+  await assert.rejects(missing.execute('task', args), { code: 'API_RESPONSE' });
+  assert.deepEqual(missing.calls.map(call => call.method), ['GET']);
+});
+
+test('tag changes use canonical names, escaped paths, no-op checks, and empty success responses', async t => {
+  let current = task('abc123', { tags: [{ name: 'Old' }] });
+  const app = fixture(t, call => {
+    if (call.path === 'space/300/tag') return { tags: [{ name: 'Bug / triage?' }] };
+    if (call.method === 'POST') { current.tags.push({ name: 'Bug / triage?' }); return new Response(null, { status: 204 }); }
+    if (call.method === 'DELETE') { current.tags = current.tags.filter(tag => tag.name !== 'Old'); return new Response(''); }
+    if (call.method === 'PUT') current = { ...current, ...call.body };
+    return current;
+  });
+  const args = ['update', 'abc123', '--add-tag', 'bug / triage?', '--remove-tag', 'old', '--name', 'New'];
+  const dry = await app.execute('task', [...args, '--dry-run']);
+  assert.deepEqual(dry.requests.map(request => request.method), ['POST', 'DELETE', 'PUT']);
+  assert.ok(app.calls.every(call => call.method === 'GET'));
+  const result = await app.execute('task', args);
+  assert.equal(result.task.tags, 'Bug / triage?');
+  assert.deepEqual(app.calls.slice(-3).map(call => call.path), ['task/abc123/tag/Bug%20%2F%20triage%3F', 'task/abc123/tag/Old', 'task/abc123']);
+  assert.equal((await app.execute('task', args)).changed, false);
+  assert.equal(app.calls.filter(call => call.method !== 'GET').length, 3);
+  const removed = await app.execute('task', ['update', 'abc123', '--remove-tag', 'Bug / triage?']);
+  assert.equal(removed.task.tags, '');
+});
+
+test('missing tags and invalid statuses prevent all writes, including other field changes', async t => {
+  const app = fixture(t, call => call.path === 'task/abc123' ? task() : hierarchy(call));
+  for (const args of [
+    ['update', 'abc123', '--name', 'New', '--add-tag', 'Bu'],
+    ['update', 'abc123', '--status', 'bogus', '--add-tag', 'Bug'],
+    ['create', '--list', '200', '--name', 'New', '--tag', 'New tag'],
+  ]) await assert.rejects(app.execute('task', args), { code: 'NAME_NOT_FOUND' });
+  assert.ok(app.calls.every(call => call.method === 'GET'));
+});
+
+test('partial tag edits report confirmed writes and never retry or roll back', async t => {
+  const app = fixture(t, call => {
+    if (call.method === 'DELETE') return new Response('', { status: 500 });
+    if (call.method === 'POST') return {};
+    if (call.path === 'space/300/tag') return { tags: [{ name: 'Bug' }] };
+    return task('abc123', { tags: [{ name: 'Old' }] });
+  });
+  await assert.rejects(app.execute('task', ['update', 'abc123', '--add-tag', 'Bug', '--remove-tag', 'Old', '--name', 'New']), error => {
+    assert.equal(error.code, 'PARTIAL_WRITE');
+    assert.match(error.message, /1 of 3.*may also have succeeded/);
+    assert.ok(error.suggestions.some(hint => hint.includes('No rollback')));
+    return true;
+  });
+  assert.deepEqual(app.calls.map(call => call.method), ['GET', 'GET', 'POST', 'DELETE']);
+});
+
+test('close previews by default, uses closed not done, and --dry-run overrides --yes', async t => {
+  let current = task('abc123', { status: { status: 'done', type: 'done' } });
+  const app = fixture(t, call => {
+    if (call.path === 'list/200') return list();
+    if (call.method === 'PUT') current = task('abc123', { status: { status: call.body.status, type: 'closed' } });
+    return current;
+  });
+  for (const flags of [[], ['--yes', '--dry-run']]) {
+    const result = await app.execute('task', ['close', 'abc123', ...flags]);
+    assert.equal(result.dryRun, true);
+    assert.deepEqual(result.body, { status: 'closed' });
+    assert.equal(result.task.name, 'Fix login');
+  }
+  assert.ok(app.calls.every(call => call.method === 'GET'));
+  assert.equal((await app.execute('task', ['close', 'abc123', '--yes'])).action, 'closed');
+  const before = app.calls.length;
+  assert.equal((await app.execute('task', ['close', 'abc123', '--yes'])).changed, false);
+  assert.equal(app.calls.length, before + 1);
+  assert.equal(app.calls.filter(call => call.method === 'PUT').length, 1);
+  for (const statuses of [[], [{ status: 'done', type: 'done' }], [{ status: 'a', type: 'closed' }, { status: 'b', type: 'closed' }]]) {
+    const bad = fixture(t, call => call.path === 'list/200' ? { statuses } : task());
+    await assert.rejects(bad.execute('task', ['close', 'abc123', '--yes']), { code: 'API_RESPONSE' });
+    assert.ok(bad.calls.every(call => call.method === 'GET'));
+  }
+});
+
+test('moves change only the home List with one v3 request and resolve custom task IDs', async t => {
+  const app = fixture(t, call => {
+    if (call.path === 'list/201') return list('201', { name: 'Next' });
+    if (call.version === 'v3') return new Response('');
+    return task('abc123');
+  });
+  const args = ['move', 'PROJ-42', '--workspace', '100', '--list', '201'];
+  const dry = await app.execute('task', [...args, '--dry-run']);
+  assert.equal(dry.path, '/api/v3/workspaces/100/tasks/abc123/home_list/201');
+  assert.deepEqual(dry.body, {});
+  assert.ok(app.calls.every(call => call.method === 'GET'));
+  const result = await app.execute('task', args);
+  assert.equal(result.action, 'moved');
+  assert.equal(result.from.id, '200');
+  assert.equal(result.to.id, '201');
+  assert.deepEqual(app.calls.filter(call => call.method !== 'GET').map(call => [call.version, call.method, call.path, call.body]), [
+    ['v3', 'PUT', 'workspaces/100/tasks/abc123/home_list/201', {}],
+  ]);
+  const before = app.calls.length;
+  assert.equal((await app.execute('task', ['move', 'abc123', '--list', '200'])).changed, false);
+  assert.equal(app.calls.length, before + 1);
+});
+
+test('moves require explicit status remaps and never add a hidden status write', async t => {
+  const app = fixture(t, call => call.path === 'list/201' ? list('201', { statuses: [{ id: 'queue-id', status: 'Queued', type: 'open' }] }) : task());
+  const args = ['move', 'abc123', '--workspace', '100', '--list', '201'];
+  await assert.rejects(app.execute('task', args), { code: 'VALIDATION_ERROR' });
+  await assert.rejects(app.execute('task', [...args, '--status', 'absent']), { code: 'NAME_NOT_FOUND' });
+  const dry = await app.execute('task', [...args, '--status', 'queued', '--dry-run']);
+  assert.deepEqual(dry.body, { status_mappings: [{ source_status: 'open-id', destination_status: 'queue-id' }] });
+  assert.equal(dry.status, 'Queued');
+  assert.ok(app.calls.every(call => call.method === 'GET'));
+  const kept = fixture(t, call => call.path === 'list/201' ? list('201') : task());
+  await assert.rejects(kept.execute('task', [...args, '--status', 'closed']), { code: 'VALIDATION_ERROR' });
+  assert.ok(kept.calls.every(call => call.method === 'GET'));
+});
+
+test('dashboard, task lists, and bounded search all request newest updates first', async t => {
+  const app = fixture(t, call => {
+    assert.equal(call.query.order_by, 'updated');
+    const names = call.query.reverse === 'false' ? ['newest', 'oldest'] : ['oldest', 'newest'];
+    return { tasks: names.map(name => task(name, { name })) };
+  });
+  writeFileSync(join(app.cwd, '.clickup-axi.json'), JSON.stringify({ list: '200' }));
+  for (const [command, args] of [['tasks', []], ['search', ['e', '--pages', '1']]]) {
+    const result = await app.execute(command, [...args, '--assignee', 'all']);
+    assert.equal(result.tasks[0].id, 'newest');
+  }
+  const home = fixture(t, call => call.path === 'user' ? basics(call) : { tasks: [task(call.query.reverse === 'false' ? 'newest' : 'oldest')] }, { env: { CLICKUP_API_TOKEN: TOKEN, CLICKUP_LIST_ID: '200' } });
+  assert.equal((await home.execute('home')).tasks[0].id, 'newest');
+});
+
+test('CLICKUP_API_TOKEN is the only supported token environment variable', async t => {
+  for (const env of [
+    { CLICKUP_API_TOKEN: TOKEN },
+    { CLICKUP_API_TOKEN: TOKEN, CLICKUP_TOKEN: 'pk_ignored_alias' },
+  ]) {
+    const app = fixture(t, basics, { env });
+    assert.equal((await app.execute('workspaces')).count, 1);
+    assert.equal(app.calls.length, 1);
+  }
+  for (const token of [undefined, '', 'bad token']) {
+    const app = fixture(t, undefined, { env: { CLICKUP_API_TOKEN: token, CLICKUP_TOKEN: TOKEN } });
+    await assert.rejects(app.execute('workspaces'), { code: 'AUTH_REQUIRED' });
+    assert.equal(app.calls.length, 0);
+  }
+  const rejected = fixture(t, () => new Response('', { status: 401 }), { env: { CLICKUP_API_TOKEN: TOKEN, CLICKUP_TOKEN: 'pk_ignored_alias' } });
+  await assert.rejects(rejected.execute('workspaces'), error => error.code === 'HTTP_401' && error.suggestions[0].includes('CLICKUP_API_TOKEN'));
+  assert.equal(rejected.calls.length, 1);
+});
+
+test('credentials are read once per command and refreshed for the next command', async t => {
+  const env = { CLICKUP_API_TOKEN: TOKEN };
+  const app = fixture(t, call => {
+    env.CLICKUP_API_TOKEN = '';
+    return call.path.endsWith('/comment') ? { comments: [] } : task();
+  }, { env });
+  mkdirSync(join(app.cwd, '.env'));
+  await app.execute('task', ['abc123']);
+  assert.equal(app.calls.length, 2);
+  await assert.rejects(app.execute('task', ['abc123']), { code: 'AUTH_REQUIRED' });
+  assert.equal(app.calls.length, 2);
+});
+
+test('environment wins over .env, which supplies only CLICKUP_API_TOKEN without executing code', async t => {
+  const env = {};
+  const app = fixture(t, basics, { env });
+  const content = `CLICKUP_TOKEN=ignored\nCLICKUP_WORKSPACE_ID=bad\nOTHER=$(touch should-not-exist)\nexport CLICKUP_API_TOKEN='${TOKEN}' # comment\n`;
+  writeFileSync(join(app.cwd, '.env'), content);
+  assert.equal((await app.execute('workspaces')).count, 1);
+  assert.equal(readToken(env, app.cwd), TOKEN);
+  assert.deepEqual(env, {});
+  assert.equal(existsSync(join(app.cwd, 'should-not-exist')), false);
+  assert.equal(readFileSync(join(app.cwd, '.env'), 'utf8'), content);
+  env.CLICKUP_API_TOKEN = TOKEN;
+  writeFileSync(join(app.cwd, '.env'), 'CLICKUP_API_TOKEN=bad');
+  assert.equal((await app.execute('workspaces')).count, 1);
+  env.CLICKUP_API_TOKEN = '';
+  await assert.rejects(app.execute('workspaces'), { code: 'AUTH_REQUIRED' });
+  assert.equal(app.calls.length, 2);
+});
+
+test('.env lookup uses the closest token and stops at the Git boundary', async t => {
+  const app = fixture(t, basics, { env: {} });
+  writeFileSync(join(app.cwd, '.env'), `CLICKUP_API_TOKEN=${TOKEN}\n`);
+  mkdirSync(join(app.cwd, 'sub', 'nested'), { recursive: true });
+  writeFileSync(join(app.cwd, 'sub', '.env'), 'UNRELATED=1');
+  const cwd = join(app.cwd, 'sub', 'nested');
+  assert.equal(readToken({}, cwd), TOKEN);
+  writeFileSync(join(app.cwd, 'sub', '.env'), 'CLICKUP_API_TOKEN=pk_closest\n');
+  assert.equal(readToken({}, cwd), 'pk_closest');
+  mkdirSync(join(cwd, '.git'));
+  assert.throws(() => readToken({}, cwd), { code: 'AUTH_REQUIRED' });
+  assert.equal(app.calls.length, 0);
+});
+
+test('unusable .env files fail without API access or exposing their contents', async t => {
+  for (const content of [null, 'x'.repeat(1024 * 1024 + 1), `CLICKUP_API_TOKEN="${TOKEN} bad"`]) {
+    const app = fixture(t, undefined, { env: {} });
+    if (content === null) mkdirSync(join(app.cwd, '.env'));
+    else writeFileSync(join(app.cwd, '.env'), content);
+    const result = await output(['workspaces'], app.config);
+    assert.equal(result.code, 1);
+    assert.ok(!result.text.includes(TOKEN));
+    assert.equal(app.calls.length, 0);
+  }
+});
+
+test('a rejected environment credential never selects a .env token', async t => {
+  const app = fixture(t, () => new Response('', { status: 401 }));
+  writeFileSync(join(app.cwd, '.env'), 'CLICKUP_API_TOKEN=pk_other_identity');
+  await assert.rejects(app.execute('workspaces'), { code: 'HTTP_401' });
+  assert.equal(app.calls.length, 1);
+});
+
+test('removed auth commands fail without reading credentials or writing files', async t => {
+  const app = fixture(t, undefined, { env: {} });
+  mkdirSync(join(app.cwd, '.env'));
+  for (const args of [[], ['login', TOKEN], ['login', '--token-stdin'], ['logout'], ['status']]) {
+    const result = await output(['auth', ...args], app.config);
+    assert.equal(result.code, 2);
+    assert.ok(!result.text.includes(TOKEN));
+  }
+  assert.equal(existsSync(join(app.cwd, 'home')), false);
+  assert.equal(app.calls.length, 0);
 });
 
 test('authentication and HTTP failures are structured, redacted, and never retried', async t => {
@@ -360,8 +762,8 @@ test('network and malformed responses never become false empty results', async t
   }
 });
 
-test('timeout and token aliases work without exposing credentials', async () => {
-  const client = createClient({ env: { CLICKUP_TOKEN: TOKEN }, timeoutMs: 1, fetchImpl: async (_url, init) => {
+test('timeouts work without exposing credentials', async () => {
+  const client = createClient({ env: { CLICKUP_API_TOKEN: TOKEN }, timeoutMs: 1, fetchImpl: async (_url, init) => {
     assert.equal(init.headers.Authorization, TOKEN);
     init.signal.throwIfAborted();
     await new Promise((_, reject) => {

@@ -1,6 +1,34 @@
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, statSync, lstatSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import { AxiError } from 'axi-sdk-js';
+import { parseEnv } from 'node:util';
+import { AxiError } from './output.js';
+
+function validateToken(token) {
+  if (typeof token !== 'string' || !token || token.length > 4096 || /[^\x21-\x7e]/.test(token)) {
+    throw new AxiError('A valid ClickUp API token is required.', 'AUTH_REQUIRED', ['Set CLICKUP_API_TOKEN in your environment or .env. Create a personal token in ClickUp Settings > Apps. Never put tokens in arguments, chat, or tracked files.']);
+  }
+  return token;
+}
+
+export function readToken(env, cwd) {
+  if (env.CLICKUP_API_TOKEN !== undefined) return validateToken(env.CLICKUP_API_TOKEN);
+  for (let dir = resolve(cwd); ; dir = dirname(dir)) {
+    const file = join(dir, '.env');
+    let values;
+    let found = false;
+    try {
+      let stat = lstatSync(file);
+      found = true;
+      if (stat.isSymbolicLink()) stat = statSync(file);
+      if (!stat.isFile() || stat.size > 1024 * 1024) throw new Error('Invalid .env file');
+      values = parseEnv(readFileSync(file, 'utf8'));
+    } catch (error) {
+      if (error.code !== 'ENOENT' || found) throw new AxiError(`Cannot read ${file} as a .env file.`, 'CONFIG_ERROR', ['Use a regular UTF-8 .env file smaller than 1 MiB. Never commit it.']);
+    }
+    if (values?.CLICKUP_API_TOKEN !== undefined) return validateToken(values.CLICKUP_API_TOKEN);
+    if (existsSync(join(dir, '.git')) || dirname(dir) === dir) return validateToken(undefined);
+  }
+}
 
 export function usage(message, help = 'Run `clickup-axi --help`.') {
   throw new AxiError(message, 'VALIDATION_ERROR', [help]);
@@ -57,19 +85,18 @@ export function requireTask(data) {
   return data;
 }
 
-export function createClient({ env = process.env, fetchImpl = fetch, timeoutMs = 15000 } = {}) {
-  return async function request(method, path, query = {}, body) {
-    const token = env.CLICKUP_API_TOKEN ?? env.CLICKUP_TOKEN;
-    if (!token || /[\s\x00-\x1f\x7f]/.test(token)) {
-      throw new AxiError('Set CLICKUP_API_TOKEN to a valid ClickUp API token.', 'AUTH_REQUIRED', ['Create a personal token in ClickUp Settings > Apps. Keep it in your environment, not in command arguments or project files.']);
-    }
-    const url = new URL(`https://api.clickup.com/api/v2/${path}`);
+export function createClient({ env = process.env, cwd = process.cwd(), fetchImpl = fetch, timeoutMs = 15000 } = {}) {
+  let token;
+  return async function request(method, path, query = {}, body, version = 'v2') {
+    token ??= readToken(env, cwd);
+    if (!['v2', 'v3'].includes(version)) usage('Unsupported ClickUp API version.');
+    const url = new URL(`https://api.clickup.com/api/${version}/${path}`);
     for (const [key, value] of Object.entries(query)) {
       if (value !== undefined) url.searchParams.set(key, String(value));
     }
     const write = method !== 'GET';
     const recovery = write
-      ? 'The write may have succeeded. Read the task or comments before retrying; do not repeat a create or comment blindly.'
+      ? 'The write may have succeeded. Read the task or comments before retrying; do not repeat a create, comment, or description append blindly.'
       : 'Check your connection and try the read command again.';
     let response;
     let data;
@@ -82,7 +109,10 @@ export function createClient({ env = process.env, fetchImpl = fetch, timeoutMs =
         redirect: 'error',
       });
       // Never print raw response bodies, which can contain credentials or HTML.
-      if (response.ok) data = await response.json();
+      if (response.ok) {
+        const text = await response.text();
+        data = text ? JSON.parse(text) : write ? {} : null;
+      }
     } catch {
       throw new AxiError('ClickUp could not return a complete response (network error, timeout, or invalid JSON).', 'REQUEST_FAILED', [recovery]);
     }
@@ -90,7 +120,7 @@ export function createClient({ env = process.env, fetchImpl = fetch, timeoutMs =
       const status = response.status;
       const errors = {
         400: ['ClickUp rejected the supplied fields.', 'Check IDs and field values. Use `clickup-axi list <id>` to see allowed statuses.'],
-        401: ['ClickUp rejected your API token.', 'Set CLICKUP_API_TOKEN to a current token.'],
+        401: ['ClickUp rejected your API token.', 'Check CLICKUP_API_TOKEN in your environment or .env. A rejected environment token does not select a .env token.'],
         403: ['You do not have access to this ClickUp resource.', 'Check your workspace and resource permissions.'],
         404: ['The ClickUp resource was not found.', 'Check the ID. Custom task IDs require --custom and a workspace.'],
       };

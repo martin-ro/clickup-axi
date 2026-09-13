@@ -1,7 +1,8 @@
 # clickup-axi
 
 An agent-friendly ClickUp CLI based on the [AXI principles](https://axi.md/).
-It uses the ClickUp REST API and `axi-sdk-js`. No MCP server, daemon, or build step.
+It uses the ClickUp REST API and Node.js built-ins only. No external packages,
+other ClickUp CLI, MCP server, daemon, or build step.
 
 ## Run
 
@@ -12,10 +13,9 @@ npm ci --ignore-scripts
 node bin/clickup-axi.js --help
 ```
 
-Set `CLICKUP_API_TOKEN` in your environment through your shell or secret manager.
-Create a personal token in **ClickUp Settings > Apps**. `CLICKUP_TOKEN` is also
-accepted. Do not paste tokens into agent conversations, command arguments, or files
-in this repository. The CLI does not load `.env` files or store credentials.
+Set `CLICKUP_API_TOKEN` in your environment or local `.env`.
+Create a personal token in **ClickUp Settings > Apps**.
+Never paste tokens into agent conversations, command arguments, or tracked files.
 
 ```sh
 node bin/clickup-axi.js             # accessible workspaces, or scoped project tasks
@@ -32,6 +32,27 @@ clickup-axi --version
 This package is private and unpublished. Install from this checkout, not from an
 unrelated `clickup-axi` package. No commands check for updates or install packages.
 
+## Authentication
+
+Credential order:
+
+1. `CLICKUP_API_TOKEN` in the process environment.
+2. `CLICKUP_API_TOKEN` in the closest `.env` that defines it, up to the Git root.
+
+There are no login commands, saved credentials, OS credential-store access, or
+browser login. The CLI reads tokens but never saves them.
+
+This is the only supported token environment variable. `.env` loading reads only
+that key. It does not run shell code, expand variables, change the process environment,
+or import workspace/List defaults. `.env` remains plain text; keep it out of Git.
+The CLI does not create or change `.env` or store tokens in `.clickup-axi.json`.
+
+Credentials are read once per command. An invalid or rejected credential fails
+without trying a lower-priority token. A token must contain 1 to 4096 printable
+ASCII characters without spaces. An unreadable, non-regular, or oversized `.env`
+file fails instead of silently selecting an ancestor's token. The size limit is
+1 MiB. Use `clickup-axi workspaces` to check access with a GET request.
+
 ## Common commands
 
 Put flags **after** the command. Every command supports `--help` without credentials.
@@ -44,14 +65,16 @@ clickup-axi lists --space 300       # folderless Lists only
 clickup-axi lists --folder 400      # Lists inside this Folder
 clickup-axi list 200                # description, task count, allowed statuses
 clickup-axi members --workspace 100
+clickup-axi tags --space "Development"
 
 clickup-axi tasks --workspace 100
 clickup-axi tasks --list 200 --assignee all
+clickup-axi tasks --list "Sprint" --space "Development" --assignee "Alice"
 clickup-axi tasks --workspace 100 --assignee 7 --status "in progress"
 clickup-axi tasks --list 200 --fields id,name,priority,assignees,due_date
 clickup-axi search "login redirect" --list 200 --include-closed
 clickup-axi task abc123
-clickup-axi task PROJ-42 --custom --workspace 100
+clickup-axi task PROJ-42 --workspace 100
 clickup-axi task abc123 --full
 clickup-axi comments abc123
 
@@ -62,11 +85,30 @@ clickup-axi task update abc123 --assignee 7 --unassign 8 --dry-run
 clickup-axi task update abc123 --due 2026-12-01
 clickup-axi task update abc123 --due none --description ""
 clickup-axi task comment abc123 --text "Ready for review"
+clickup-axi task create --list "Sprint" --space "Development" --name "Fix login" --tag bug
+clickup-axi task update abc123 --add-tag bug --add-tag backend --remove-tag duplicate
+clickup-axi task update abc123 --parent def456 --dry-run
+clickup-axi task update abc123 --append-description="- Add a regression check"
+clickup-axi task move abc123 --list "Next sprint" --space "Development" --dry-run
+clickup-axi task move abc123 --list 201 --status "to do" --dry-run
+clickup-axi task close abc123       # preview only
+clickup-axi task close abc123 --yes # writes after user approval
 ```
 
-IDs must be explicit. There is no name lookup. `task` and `comments` use internal
-task IDs unless you pass `--custom`. Custom IDs require a selected workspace.
-A parent ID on task creation must be an internal ID in the same List.
+Workspaces, Spaces, Folders, Lists, and assignees accept names or IDs. Lookup uses
+case-insensitive exact matches first, then a unique name substring. Assignees also
+accept exact email addresses and `me`. Ambiguous names fail with candidate IDs.
+List and Folder names require `--space`. List lookup checks folderless Lists and
+all active Folders in that Space. It never uses a partial inventory after an error.
+Numeric IDs avoid name discovery. Project and environment defaults remain IDs.
+
+Tasks still require IDs, not titles. `PREFIX-123` custom IDs are detected automatically;
+use `--custom` for other custom-ID formats. Custom IDs require a selected workspace.
+Parent IDs can be internal or `PREFIX-123` custom IDs, and must be in the same home List.
+
+Tags on create (`--tag`) and update (`--add-tag`, `--remove-tag`) are repeatable.
+Commas are literal, not separators. Other flags cannot repeat. For text that starts
+with a dash, use the equals form: `--append-description="- New item"`.
 
 `tasks` and `search` include subtasks and exclude closed tasks by default.
 The default assignee is `me`. Use `--assignee all` for all visible assignees.
@@ -96,8 +138,11 @@ tasks. Without a scope, it shows authorized workspaces instead of unrelated task
 
 ## Output and pagination
 
-Output is [TOON](https://toonformat.dev/), with four task columns by default:
+Output is [TOON](https://toonformat.dev/) 4.1, with four task columns by default:
 `id,name,status,list`. Use `--fields` to select other supported columns.
+A local encoder handles JSON-shaped output with commas and two-space indentation.
+It uses JavaScript numbers; missing values and non-finite numbers become `null`.
+Invalid Unicode surrogates fail instead of changing text. There is no format library.
 
 - `count` is the number of displayed rows.
 - `totalCount` is exact only when the complete scope was read. `null` means unknown.
@@ -118,24 +163,48 @@ Output is [TOON](https://toonformat.dev/), with four task columns by default:
 
 Empty results are explicit. Errors are structured on stdout. Exit codes are
 `0` for success, `1` for API or setup failure, and `2` for invalid input.
-Unknown flags, duplicate flags, and extra arguments fail before API access.
+Unknown flags, duplicate non-repeatable flags, and extra arguments fail before API access.
 
 ## Write safety
 
 - `task update` reads current state, changes only supplied fields, and returns
   success without a write if those fields already match.
-- Creation and comments are **not idempotent**. Each invocation creates a new item.
-  No network request is retried automatically. After an uncertain response, inspect
-  ClickUp before repeating a create or comment.
-- Every mutation accepts `--dry-run`. Update previews still read the current task.
+- Creation, comments, and description appends are **not idempotent**. Repeating
+  them adds content again. No network request is retried automatically. After an
+  uncertain response, inspect ClickUp before repeating a write.
+- `--dry-run` is **optional**, not the default. Without it, mutations write.
+  The exception is `task close`, which previews unless you supply `--yes`.
+  `--dry-run` always prevents writes, even with `--yes`. Previews can make GET
+  requests to resolve names and check task state, statuses, parents, and tags.
+- `task close` selects the List's `closed`-type status, not its `done` status.
+  Already-closed tasks need no write. Closing hides tasks from default listings.
+- `task move` changes the **home List**, not additional List memberships. It uses
+  API v3, moves subtasks with their parent, and does not request custom-field
+  transfer. It requires an explicit destination, never a project default. If the
+  destination lacks the current status, you must supply `--status`. If it has that
+  status, a different override is rejected. ClickUp may reject moves with other
+  status conflicts, including subtask conflicts. No extra status write is hidden.
+- `--parent` rejects self-parenting, parent cycles, and parents in another home List.
+  The API cannot promote a subtask by clearing its parent. Use ClickUp for that.
+- Added tags must already exist in the Space. Exact case-insensitive matches use
+  the stored name to avoid creating tags from typos. Removal affects the task only.
+  Matching tag and parent changes need no write.
+- Tag edits use one request per tag, followed by one field update if needed. All
+  lookups and checks finish before writes start, but these requests are **not a
+  transaction**. A failure reports confirmed writes and warns that the failed
+  request may also have succeeded. No rollback is attempted. Inspect before retrying.
 - `--assignee` adds one user. `--unassign` removes one user. Other assignees stay.
 - `--description ""` clears the description using ClickUp's single-space payload.
+- `--append-description` reads Markdown source and appends with a blank line. It
+  fails if the source is unavailable. It cannot combine with `--description`.
+  This is a read-modify-write operation, not an atomic append. Concurrent edits
+  can be overwritten; do not use it while another editor is changing the description.
 - `--due YYYY-MM-DD` sets **midnight UTC with time enabled**. ClickUp otherwise
   shifts untimed dates to 4am in the creator's timezone. `--due none` clears it.
 - Comments default to `notify_all: false`. Use `--notify` to notify all assignees.
 - Requests have a 15-second timeout. Credentials go only to the fixed HTTPS ClickUp
   API origin. Redirects are rejected. Raw error bodies are never printed.
-- There are no delete commands, automatic status remaps, or background writes.
+- There are no task-delete commands, automatic status remaps, or background writes.
 
 ## Agent integration
 
@@ -150,27 +219,27 @@ clickup-axi setup hooks --global    # user scope
 clickup-axi setup remove --global
 ```
 
-Setup uses the AXI SDK to install Claude Code and Codex `SessionStart` hooks and an
-OpenCode context plugin. It updates their configuration files only on explicit
-setup. Repeated setup is a no-op when paths and settings are unchanged.
+Setup uses Node.js built-ins to install Claude Code and Codex `SessionStart` hooks
+and an OpenCode context plugin. It updates their configuration files only on
+explicit setup. Repeated setup is a no-op when paths and settings are unchanged.
 
 Project setup writes `.claude/settings.json`, `.codex/hooks.json`, and a managed
 plugin under `.opencode/plugins/`. It also enables `[features].hooks = true` in
 **`~/.codex/config.toml`**, even for project setup. User setup uses the equivalent
 user directories. Removing hooks leaves this shared Codex feature flag enabled.
 Existing unrelated hook entries are kept. Setup reports partial failures.
+Complex TOML requires manual configuration of the Codex feature flag; setup does
+not try to parse it. Status reports `null` when the flag cannot be verified.
+Unrecognized OpenCode plugin files are not replaced or removed.
 
-Hooks run the content-first home view with a 10-second host timeout. Authentication
-must be available in the host environment. Use a stable install path without spaces
-or shell symbols; the current SDK cannot safely quote such paths for every host.
+Hooks run the content-first home view with a 10-second host timeout. The host must
+have access to `CLICKUP_API_TOKEN` in its environment or the project's `.env`.
+Use stable Node and CLI install paths without spaces or shell symbols.
+The OpenCode plugin caches context once per session.
 
 For on-demand guidance instead of session hooks, install
 [`skills/clickup-axi/SKILL.md`](skills/clickup-axi/SKILL.md) through your agent's
-skill loader. With the Skills CLI, run this from the checkout:
-
-```sh
-npx skills add . --skill clickup-axi
-```
+skill loader. No skill-install package is needed.
 
 The skill uses the locally installed binary. Its guidance is generated from
 `src/help.js` and checked in CI. You can use hooks, the skill, or both.
@@ -183,10 +252,12 @@ npm run check     # skill consistency and offline tests
 npm pack --dry-run
 ```
 
-Tests use fake API responses and temporary agent config directories. They do not
-need a token or change live ClickUp data. Twelve live read checks also passed,
-covering workspace discovery, tasks, search, and comments. They used only GET
-requests. Live mutations have not been tested.
+Offline tests use fake API responses and temporary config directories. They do
+not read real credentials or change live ClickUp data. They cover token lookup,
+TOON output, command validation, task operations, and hook file changes.
+Earlier live checks covered discovery, tasks, search, comments, name lookup, write
+previews, and sorting. Request guards blocked all live writes. Live mutations and
+real agent-host hook execution have not been tested. No real hooks were installed.
 
 This first version does not cover Docs, time tracking, custom-field writes,
 attachments, bulk operations, or OAuth login flows.
